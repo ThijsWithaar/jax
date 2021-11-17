@@ -116,6 +116,7 @@ py_library(
         "init.py",
         "lapack.py",
         "pocketfft.py",
+        "signal.py",
         "version.py",
     ] + if_rocm_is_configured([
         "rocsolver.py",
@@ -209,6 +210,19 @@ pybind_extension(
     deps = [
         ":kernel_pybind11_helpers",
         ":pocketfft_kernels",
+        "@pybind11",
+    ],
+)
+
+# Signal
+
+pybind_extension(
+    name = "_signal",
+    srcs = ["signal.cc"],
+    features = ["-use_header_modules"],
+    module_name = "_signal",
+    deps = [
+        ":kernel_pybind11_helpers",
         "@pybind11",
     ],
 )

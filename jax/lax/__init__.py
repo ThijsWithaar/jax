@@ -166,6 +166,7 @@ from jax._src.lax.lax import (
   itertools as itertools,
   le as le,
   le_p as le_p,
+  lfilter as lfilter,
   lgamma as lgamma,
   lgamma_p as lgamma_p,
   log as log,
