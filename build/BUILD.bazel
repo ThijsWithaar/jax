@@ -33,6 +33,7 @@ py_binary(
         "//jaxlib:setup.cfg",
         "//jaxlib:cpu_feature_guard.so",
         "//jaxlib:_lapack.so",
+        "//jaxlib:_ndimage.so",
         "//jaxlib:_pocketfft.so",
         "//jaxlib:_signal.so",
         "//jaxlib/mlir:builtin_dialect",

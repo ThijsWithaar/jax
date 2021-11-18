@@ -22,7 +22,7 @@ from typing import Optional
 
 __all__ = [
   'cuda_linalg', 'cuda_prng', 'cusolver', 'rocsolver', 'jaxlib', 'lapack',
-  'pocketfft', 'pytree', 'signal', 'tpu_driver_client', 'version', 'xla_client',
+  'ndimage', 'pocketfft', 'pytree', 'signal', 'tpu_driver_client', 'version', 'xla_client',
   'xla_extension',
 ]
 
@@ -73,6 +73,7 @@ cpu_feature_guard.check_cpu_features()
 
 import jaxlib.xla_client as xla_client
 import jaxlib.lapack as lapack
+import jaxlib.ndimage as ndimage
 import jaxlib.pocketfft as pocketfft
 import jaxlib.signal as signal
 

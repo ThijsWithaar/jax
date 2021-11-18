@@ -173,6 +173,19 @@ pybind_extension(
     ],
 )
 
+# NdImage
+
+pybind_extension(
+    name = "_ndimage",
+    srcs = ["ndimage.cc"],
+    features = ["-use_header_modules"],
+    module_name = "_ndimage",
+    deps = [
+        ":kernel_pybind11_helpers",
+        "@pybind11",
+    ],
+)
+
 # PocketFFT
 
 flatbuffer_cc_library(
