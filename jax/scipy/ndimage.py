@@ -15,5 +15,6 @@
 # flake8: noqa: F401
 
 from jax._src.scipy.ndimage import (
+  affine_transform as affine_transform,
   map_coordinates as map_coordinates,
 )

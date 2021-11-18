@@ -134,3 +134,20 @@ def map_coordinates(
     input, coordinates, order, mode='constant', cval=0.0,
 ):
   return _map_coordinates(input, coordinates, order, mode, cval)
+
+
+@_wraps(scipy.ndimage.affine_transform, lax_description=textwrap.dedent("""\
+	Only linear interpolation (``order=1``) and modes ``'nearest'`` are currently supported.
+	"""))
+def affine_transform(input, matrix, offset=0.0):
+  # Convert to homogeneous transform
+  if matrix.shape == [3,3]:
+    H = matrix
+  else:
+    H = np.zeros((3,3), dtype=np.float64)
+    H[2,2] = 1
+    H[:matrix.shape[0], :matrix.shape[1]] = matrix
+    H[:2,2] += offset
+
+  O = lax.ndimage.affine_transform(I, H)
+  return O

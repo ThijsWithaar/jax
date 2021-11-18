@@ -332,6 +332,10 @@ from jax._src.lax.fft import (
   fft as fft,
   fft_p as fft_p,
 )
+from jax._src.lax.ndimage import (
+  affine_transform as affine_transform,
+  affine_transform_p as affine_transform_p,
+)
 from jax._src.lax.parallel import (
   all_gather as all_gather,
   all_to_all as all_to_all,

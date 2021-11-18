@@ -181,6 +181,8 @@ def prepare_wheel(sources_path):
   copy_to_jaxlib(r.Rlocation("__main__/jaxlib/cpu_feature_guard.so"))
   copy_to_jaxlib(r.Rlocation("__main__/jaxlib/lapack.py"))
   copy_to_jaxlib(r.Rlocation("__main__/jaxlib/_lapack.so"))
+  copy_to_jaxlib(r.Rlocation("__main__/jaxlib/_ndimage.so"))
+  copy_to_jaxlib(r.Rlocation("__main__/jaxlib/ndimage.py"))
   copy_to_jaxlib(r.Rlocation("__main__/jaxlib/_pocketfft.so"))
   copy_to_jaxlib(r.Rlocation("__main__/jaxlib/pocketfft_flatbuffers_py_generated.py"))
   copy_to_jaxlib(r.Rlocation("__main__/jaxlib/pocketfft.py"))
