@@ -105,6 +105,14 @@ class LaxBackedScipySignalTests(jtu.JaxTestCase):
     self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, tol=tol)
     self._CompileAndCheck(jsp_fun, args_maker, rtol=tol, atol=tol)
 
+  def testLfilter(self):
+    a = np.array([2, 1], np.float32)
+    b = np.array([3, 4], np.float32)
+    x = (np.r_[0:8] == 1).astype(np.float32)
+
+    args_maker = lambda: [b,a,x]
+    tol = {np.float32: 1e-5, np.float64: 1e-12}
+    self._CheckAgainstNumpy(osp_signal.lfilter, jsp_signal.lfilter, args_maker, tol=tol)
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

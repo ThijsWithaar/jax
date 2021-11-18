@@ -1,7 +1,20 @@
+import numpy as np
+
+from jax.core import Primitive
+from jax.interpreters import ad
 from jax.interpreters import xla
 from jax._src.numpy import lax_numpy as jnp
+from jax._src.numpy import fft
 from jax._src.lib import xla_client
 from jax._src.lib import signal
+
+__all__ = [
+  "lfilter",
+  "lfilter_p",
+]
+
+def lfilter(b, a, x):
+  return lfilter_p.bind(b, a, x)
 
 def lfilter_impl(b, a, x, axis=-1, zi=None):
   return xla.apply_primitive(lfilter_p, b, a, x)
@@ -16,25 +29,27 @@ def _lfilter_jvp_rule(primals, tangents):
   b, a, x = primals
   db, da, dx = tangents
 
-  y = lfilter_p.bind(b, a, x)
+  y = lfilter(b, a, x)
 
   # Calculate derivatives in the Fourier domain, then do ifft
   # https://dsp.stackexchange.com/a/59718/627
-  polyval = jnp.polynomial.polynomial.polyval
+  polyval = np.polynomial.polynomial.polyval
   w = jnp.linspace(0, np.pi, x.size, endpoint=False)
-  z = np.exp(-1j * w)
+  z = jnp.exp(-1j * w)
   B = polyval(z, b, tensor=False)
   A = polyval(z, a, tensor=False)
   H = B/A
 
-  za = z ** jnp.r_[0:a.size]
-  Ja = np.outer(-H/A, za)
+  za = z.reshape(-1,1) ** jnp.r_[0:a.size].reshape(1,-1)
+  Ja = (-H/A).reshape(-1,1)* za
 
-  zb = z ** jnp.r_[0:b.size]
-  Jb = np.outer(1/A, zb)
+  zb = z.reshape(-1,1) ** jnp.r_[0:b.size].reshape(1,-1)
+  Jb = (1/A).reshape(-1,1) * zb
 
-  dy = dx + jnp.fft.ifft(Ja @ da + Jb @ db)
+  dy_dx = lfilter(b, a, dx)
+  dy = dy_dx + fft.ifft(Ja @ da + Jb @ db, axis=0).real
 
+  import pdb; pdb.set_trace()
   return (y,), (dy,)
 
 lfilter_p = Primitive('lfilter')

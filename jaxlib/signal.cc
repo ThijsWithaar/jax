@@ -1,7 +1,13 @@
+#include <cstdint>
+#include <complex>
+
 #include "jaxlib/kernel_pybind11_helpers.h"
 #include "include/pybind11/pybind11.h"
 
+namespace py = pybind11;
+
 namespace jax {
+namespace {
 
 
 struct lfilter_descriptor
@@ -17,13 +23,13 @@ py::bytes BuildLfilterDescriptor(size_t nB, size_t nA, size_t nX)
 template<typename T>
 void lfilter(void* out, void** in)
 {
-	const lfilter_descriptor s = UnpackDescriptor<lfilter_descriptor>(in[0]);
-	const T* pb = in[1];
-	const T* pa = in[2];
-	const T* x = in[3];
-	T* y = out[0];
+	const lfilter_descriptor s = **UnpackDescriptor<lfilter_descriptor>(reinterpret_cast<const char*>(in[0]), sizeof(lfilter_descriptor));
+	const T* pb = reinterpret_cast<const T*>(in[1]);
+	const T* pa = reinterpret_cast<const T*>(in[2]);
+	const T* x = reinterpret_cast<const T*>(in[3]);
+	T* y = reinterpret_cast<T*>(out);
 
-	const nAB = std::max(s.nA, s.nB);
+	const size_t nAB = std::max(s.nA, s.nB);
 
 	// Zero-pad a,b. normalize by a[0]
 	std::vector<T> a(nAB, T(0));
@@ -49,12 +55,12 @@ void lfilter(void* out, void** in)
 	}
 }
 
-
-namespace {
-
 pybind11::dict Registrations() {
   pybind11::dict dict;
-  dict["lfilter"] = EncapsulateFunction(lfilter);
+  dict["lfilter_f32"] = EncapsulateFunction(lfilter<float>);
+  dict["lfilter_f64"] = EncapsulateFunction(lfilter<double>);
+  dict["lfilter_c64"] = EncapsulateFunction(lfilter<std::complex<float>>);
+  dict["lfilter_c128"] = EncapsulateFunction(lfilter<std::complex<double>>);
   return dict;
 }
 

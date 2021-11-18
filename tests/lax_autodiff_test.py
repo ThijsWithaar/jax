@@ -612,6 +612,13 @@ class LaxAutodiffTest(jtu.JaxTestCase):
     dus = lambda y: lax.dynamic_update_slice(operand, y, start_indices)
     check_grads(dus, (update,), 2, ["fwd", "rev"], eps=1.)
 
+  def testLfilterGrad(self):
+    a = np.array([100, 10], np.float32)
+    b = np.array([ 30, 40], np.float32)
+    x = (np.r_[0:8] == 1).astype(np.float32)
+
+    check_grads(lax.lfilter, (b,a,x), 2, ["fwd", "rev"], eps=1e-3)
+
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_shape={}_perm={}".format(
           jtu.format_shape_dtype_string(shape, dtype), perm),

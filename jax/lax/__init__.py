@@ -166,7 +166,6 @@ from jax._src.lax.lax import (
   itertools as itertools,
   le as le,
   le_p as le_p,
-  lfilter as lfilter,
   lgamma as lgamma,
   lgamma_p as lgamma_p,
   log as log,
@@ -353,6 +352,10 @@ from jax._src.lax.parallel import (
   pswapaxes as pswapaxes,
   pdot as pdot,
   xeinsum as xeinsum,
+)
+from jax._src.lax.signal import (
+  lfilter as lfilter,
+  lfilter_p as lfilter_p,
 )
 from jax._src.lax.other import (
   conv_general_dilated_patches as conv_general_dilated_patches
