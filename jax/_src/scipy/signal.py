@@ -150,7 +150,7 @@ def detrend(data, axis=-1, type='linear', bp=0, overwrite_data=None):
 @_wraps(osp_signal.lfilter)
 def lfilter(b, a, x, axis = -1, zi = None):
   y = lax.lfilter(b, a, x)
-  return y[0,0]
+  return y
 
 @_wraps(osp_signal.filtfilt)
 def filtfilt(b, a, x, axis = -1):

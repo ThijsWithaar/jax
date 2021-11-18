@@ -20,4 +20,5 @@ from jax._src.scipy.signal import (
   correlate as correlate,
   correlate2d as correlate2d,
   detrend as detrend,
+  lfilter as lfilter,
 )
