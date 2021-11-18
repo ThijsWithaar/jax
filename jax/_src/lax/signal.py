@@ -1,11 +1,6 @@
-import numpy as np
-
 from jax.core import Primitive
 from jax.interpreters import ad
 from jax.interpreters import xla
-from jax._src.numpy import lax_numpy as jnp
-from jax._src.numpy import fft
-from jax._src.lib import xla_client
 from jax._src.lib import signal
 
 __all__ = [
@@ -31,26 +26,24 @@ def _lfilter_jvp_rule(primals, tangents):
 
   y = lfilter(b, a, x)
 
-  # Calculate derivatives in the Fourier domain, then do ifft
-  # https://dsp.stackexchange.com/a/59718/627
-  polyval = np.polynomial.polynomial.polyval
-  w = jnp.linspace(0, np.pi, x.size, endpoint=False)
-  z = jnp.exp(-1j * w)
-  B = polyval(z, b, tensor=False)
-  A = polyval(z, a, tensor=False)
-  H = B/A
+  # The derivatives are analogues to their Fourier-domain counterparts,
+  # as described on https://dsp.stackexchange.com/a/59718:
+  # H = B / A
+  # dH/dB =  1 / A
+  # dH/dA = -H / A
+  dy_db = lfilter(db, a, x)
 
-  za = z.reshape(-1,1) ** jnp.r_[0:a.size].reshape(1,-1)
-  Ja = (-H/A).reshape(-1,1)* za
+  x_da  = lfilter(da, a, x)
+  dy_da = lfilter(b , a, -x_da)
 
-  zb = z.reshape(-1,1) ** jnp.r_[0:b.size].reshape(1,-1)
-  Jb = (1/A).reshape(-1,1) * zb
+  dy_dx = lfilter(b , a, dx)
+  dy = dy_db + dy_da + dy_dx
 
-  dy_dx = lfilter(b, a, dx)
-  dy = dy_dx + fft.ifft(Ja @ da + Jb @ db, axis=0).real
-
-  import pdb; pdb.set_trace()
   return (y,), (dy,)
+
+def _lfilter_batching_rule(vector_arg_values, batch_axes):
+  res = lfilter(*vector_arg_values)
+  return res, batch_axes[0]
 
 lfilter_p = Primitive('lfilter')
 lfilter_p.def_impl(lfilter_impl)
@@ -58,7 +51,4 @@ lfilter_p.def_abstract_eval(lfilter_abstract_eval)
 if signal:
   xla.register_translation(lfilter_p, _lfilter_translation_rule_cpu, platform='cpu')
 ad.primitive_jvps[lfilter_p] = _lfilter_jvp_rule
-
-#xla.register_translation(lfilter_p, _lfilter_translation_rule)
-#ad.deflinear2(fft_p, fft_transpose_rule)
-#batching.primitive_batchers[lfilter_p] = lfilter_batching_rule
+batching.primitive_batchers[lfilter_p] = _lfilter_batching_rule
