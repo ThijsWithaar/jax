@@ -115,6 +115,7 @@ py_library(
     srcs = [
         "init.py",
         "lapack.py",
+        "ndimage.py",
         "pocketfft.py",
         "signal.py",
         "version.py",

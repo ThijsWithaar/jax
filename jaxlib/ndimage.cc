@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <complex>
 
@@ -8,6 +9,24 @@ namespace py = pybind11;
 
 namespace jax {
 namespace {
+
+template<typename T>
+T clamp(T v, T lo, T hi)
+{
+	std::min(std::max(v, lo), hi);
+}
+
+template<typename T>
+struct remove_complex
+{
+	using type = T;
+};
+
+template<typename T>
+struct remove_complex<std::complex<T>>
+{
+	using type = T;
+};
 
 template<typename T>
 struct coordinate
@@ -28,7 +47,7 @@ py::bytes BuildNdImageDescriptor(ptrdiff_t h, ptrdiff_t w)
 // Homogeneous coordinate projection
 coordinate<double> project(const double* pH, coordinate<ptrdiff_t> ci)
 {
-	std::array<double> o{0,0,0};
+	std::array<double, 3> o{0,0,0};
 	for(size_t n=0; n<3; n++)
 	{
 		o[n] = ci.x*pH[0] + ci.x*pH[1] + pH[2];
@@ -41,14 +60,16 @@ coordinate<double> project(const double* pH, coordinate<ptrdiff_t> ci)
 template<typename T>
 T interp_linear(const T* pI, const ndimage_descriptor& s, coordinate<double> c)
 {
-	auto fetch = [](ptrdiff_t x, ptrdiff_t y)
+	using T_real = typename remove_complex<T>::type;
+
+	auto fetch = [&](ptrdiff_t x, ptrdiff_t y)
 	{
-		return std::clamp(x, 0, s.w-1) + s.w*std::clamp(y, 0, s.h-1);
+		return clamp<ptrdiff_t>(x, 0, s.w-1) + s.w*clamp<ptrdiff_t>(y, 0, s.h-1);
 	};
 
-	double yi, xi;
-	const double xf = std::modf(c.x, &xi);
-	const double yf = std::modf(c.y, &yi);
+	T_real yi, xi;
+	const T_real xf = std::modf(c.x, &xi);
+	const T_real yf = std::modf(c.y, &yi);
 
 	T vu = fetch(xi, yi  )*(1-xf) + fetch(xi+1, yi  )*xf;
 	T vd = fetch(xi, yi+1)*(1-xf) + fetch(xi+1, yi+1)*xf;
@@ -63,13 +84,13 @@ void affine_transform(void* out, void** in)
 	const double* pH = reinterpret_cast<const double*>(in[2]);
 	T* pO = reinterpret_cast<T*>(out);
 
-	coordinate<ptrdiff_t> co{0,0};
-	for(co[0]=0; co[0] < h; co[0]++)
+	coordinate<ptrdiff_t> co;
+	for(co.y=0; co.y < s.h; co.y++)
 	{
-		for(co[1]=0; co[1] < w; co[1]++)
+		for(co.x=0; co.x < s.w; co.x++)
 		{
 			coordinate<double> ci = project(pH, co);
-			pO[y*w + x] = interp_linear(pI, ndimage_descriptor, ci);
+			pO[co.y*s.w + co.x] = interp_linear(pI, s, ci);
 		}
 	}
 }
