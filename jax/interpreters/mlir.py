@@ -313,15 +313,34 @@ def _flatten_lowering_ir_args(
 
 def lower_jaxpr_to_fun(ctx: LoweringContext, name: str,
                        jaxpr: core.ClosedJaxpr, *,
-                       public: bool = False) -> str:
+                       public: bool = False,
+                       prune_tokens: bool = False) -> str:
   """Lowers jaxpr and its callees to an IR function.
 
   Assumes that an MLIR context, location, and insertion point are set.
 
-  Returns the name of the function."""
+  Args:
+    ctx: the lowering context.
+    name: the function name. The name will be uniquified by the symbol table,
+      so it is ok to use the same name multiple times.
+    jaxpr: the jaxpr to lower.
+    public: if true, the function's visibility is set to "public".
+    prune_tokens: if true, tokens are pruned from the arguments and return
+      values.
+  Returns the name of the function.
+  """
   # print(jaxpr.jaxpr)
-  input_types = map(aval_to_ir_types, jaxpr.in_avals)
-  output_types = map(aval_to_ir_types, jaxpr.out_avals)
+  if prune_tokens:
+    pruned_in_avals = [aval for aval in jaxpr.in_avals
+                       if aval is not core.abstract_token]
+    pruned_out_avals = [aval for aval in jaxpr.out_avals
+                        if aval is not core.abstract_token]
+  else:
+    pruned_in_avals = jaxpr.in_avals
+    pruned_out_avals = jaxpr.out_avals
+
+  input_types = map(aval_to_ir_types, pruned_in_avals)
+  output_types = map(aval_to_ir_types, pruned_out_avals)
   flat_input_types = util.flatten(input_types)
   flat_output_types = util.flatten(output_types)
   if ctx.tuple_results:
@@ -338,11 +357,26 @@ def lower_jaxpr_to_fun(ctx: LoweringContext, name: str,
   with ir.InsertionPoint(entry_block):
     unflattened_args = util.unflatten(entry_block.arguments,
                                       map(len, input_types))
+    # If we pruned tokens out of the parameter list, create a new token and add
+    # it here.
+    if prune_tokens and len(pruned_in_avals) != len(jaxpr.in_avals):
+      token = mhlo.CreateTokenOp(mhlo.TokenType.get()).results
+      arg_iter = iter(unflattened_args)
+      unflattened_args = [
+          token if aval is core.abstract_token else next(arg_iter)
+          for aval in jaxpr.in_avals
+      ]
+      done = object()
+      assert next(arg_iter, done) is done
+
     callee_name_stack = xla.extend_name_stack(ctx.name_stack,
                                               xla.wrap_name(name, 'jit'))
     out_vals = jaxpr_subcomp(ctx.replace(name_stack=callee_name_stack),
                              jaxpr.jaxpr, map(ir_constants, jaxpr.consts),
                              *unflattened_args)
+    if prune_tokens:
+      out_vals = [v for v, aval in zip(out_vals, jaxpr.out_avals)
+                  if aval is not core.abstract_token]
     flat_outputs = util.flatten(out_vals)
     if ctx.tuple_results:
       std.ReturnOp([mhlo.TupleOp(output_tuple_type, flat_outputs).result])
@@ -400,13 +434,9 @@ def jaxpr_subcomp(ctx: LoweringContext, jaxpr: core.Jaxpr,
             f"MLIR translation rule for primitive '{eqn.primitive.name}' not "
             "found")
 
-      try:
-        ans = rule(ctx, map(aval, eqn.invars), map(aval, eqn.outvars),
-                   *map(_unwrap_singleton_ir_values, in_nodes),
-                   **eqn.params)
-      except Exception as e:
-        raise RuntimeError(
-            f"MLIR translation failed for equation: {eqn}") from e
+      ans = rule(ctx, map(aval, eqn.invars), map(aval, eqn.outvars),
+                 *map(_unwrap_singleton_ir_values, in_nodes),
+                 **eqn.params)
 
     try:
       out_nodes = tuple(map(_wrap_singleton_ir_values, ans))
@@ -426,33 +456,23 @@ def _ir_consts(consts):
       id_: ir_constants(const) for id_, const in unique_consts.items()}
   return [ir_consts[id(const)] for const in consts]
 
-def lower_fun(fun: Callable, parallel: bool = False,
-              multiple_results: bool = True,
-              expect_avals_out: bool = True) -> TranslationRule:
-  """Converts a traceable JAX function `fun` into a lowering rule."""
-  def f(ctx, avals_in, *args, **params):
-    if parallel:
-      axis_env = params.pop('axis_env')
-      del params['platform']
-    else:
-      axis_env = xla.AxisEnv(1, (), ())
+def lower_fun(fun: Callable, multiple_results: bool = True) -> Callable:
+  """Converts a traceable JAX function `fun` into a lowering rule.
+
+  The returned function does not use `avals_out`, so callers may pass any value
+  as `avals_out`."""
+  def f_lowered(ctx, avals_in, avals_out, *args, **params):
     if multiple_results:
       f = fun
     else:
       f = lambda *args, **kw: (fun(*args, **kw),)
     wrapped_fun = lu.wrap_init(f, params)
-    with core.extend_axis_env_nd(zip(axis_env.names, axis_env.sizes)):
+    with core.extend_axis_env_nd(zip(ctx.axis_env.names, ctx.axis_env.sizes)):
       jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, avals_in)
-    ctx = ctx.replace(axis_env=axis_env, name_stack='')
     return jaxpr_subcomp(ctx, jaxpr, _ir_consts(consts),
                          *map(_wrap_singleton_ir_values, args))
 
-  if expect_avals_out:
-    def f_avals(ctx, avals_in, avals_out, *args, **params):
-      return f(ctx, avals_in, *args, **params)
-    return f_avals
-  else:
-    return f
+  return f_lowered
 
 
 
@@ -596,7 +616,7 @@ def _array_result_handler(aval: core.ShapedArray) -> ResultHandler:
   return lambda device, buffer: xla.make_device_array(aval, device, buffer)
 
 _aval_to_result_handler[core.AbstractUnit] = lambda _: lambda _: core.unit
-_aval_to_result_handler[core.AbstractToken] = lambda _: lambda _, __: xla.token
+_aval_to_result_handler[core.AbstractToken] = lambda _: lambda _: xla.token
 _aval_to_result_handler[core.ShapedArray] = _array_result_handler
 _aval_to_result_handler[core.ConcreteArray] = _array_result_handler
 
@@ -803,8 +823,12 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name, donated_invars
     tuple_args = len(avals_in) > 100  # pass long arg lists as tuple for TPU
 
   with ctx.context, ir.Location.unknown(ctx.context):
+    # XLA doesn't have a runtime representation of tokens, so we prune them out
+    # of the arguments and return values of the top-level function. This is fine
+    # since the purpose of tokens is to preserve ordering inside compiled
+    # functions.
     lower_jaxpr_to_fun(ctx, "main", core.ClosedJaxpr(jaxpr, consts),
-                       public=True)
+                       public=True, prune_tokens=True)
 
   assert not any(donated_invars), donated_invars
   # TODO(b/203122001): implement buffer donation.
@@ -1241,9 +1265,8 @@ def _scatter_lower(ctx, avals_in, avals_out, operand, indices, updates, *,
                    update_jaxpr, update_consts, dimension_numbers,
                    indices_are_sorted, unique_indices, mode):
   if mode == lax.GatherScatterMode.CLIP:
-    clip_fn = lower_fun(lax._clamp_scatter_indices, expect_avals_out=False,
-                        multiple_results=False)
-    (indices,), = clip_fn(ctx, avals_in, operand, indices, updates,
+    clip_fn = lower_fun(lax._clamp_scatter_indices, multiple_results=False)
+    (indices,), = clip_fn(ctx, avals_in, None, operand, indices, updates,
                           dnums=dimension_numbers)
 
   aval_out, = avals_out
@@ -1640,20 +1663,13 @@ translations[lax.rng_uniform_p] = _rng_uniform_lowering
 #   xla_shape = xc.Shape.array_shape(np.dtype(dtype), shape)
 #   if key_dtype == np.dtype('uint32'):
 #     # TODO(mattjj): the BitcastConvertType segfaults on GPU
-#     # TODO(mattjj): remove fallback when minimum jaxlib is 0.1.72 or newer
-#     if jaxlib_version >= (0, 1, 72) and not backend_is_gpu:
-#       u64_etype = xla.dtype_to_primitive_type(np.dtype('uint64'))
-#       key = xops.BitcastConvertType(xops.Reshape(key, (2, 2)), u64_etype)
-#     else:
-#       key = _convert_4xU32_to_2xU64_without_bitcast(c, key)
+#     u64_etype = xla.dtype_to_primitive_type(np.dtype('uint64'))
+#     key = xops.BitcastConvertType(xops.Reshape(key, (2, 2)), u64_etype)
 #   out_key, out_vals = xla.xla_destructure(
 #       c, xops.RngBitGenerator(algorithm, key, xla_shape))
 #   if key_dtype == np.dtype('uint32'):
-#     if jaxlib_version >= (0, 1, 72) and not backend_is_gpu:
-#       u32_etype = xla.dtype_to_primitive_type(np.dtype('uint32'))
-#       out_key = xops.Reshape(xops.BitcastConvertType(out_key, u32_etype), (4,))
-#     else:
-#       out_key = _convert_2xU64_to_4xU32_without_bitcast(c, out_key)
+#     u32_etype = xla.dtype_to_primitive_type(np.dtype('uint32'))
+#     out_key = xops.Reshape(xops.BitcastConvertType(out_key, u32_etype), (4,))
 #   return [out_key, out_vals]
 
 

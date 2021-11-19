@@ -137,17 +137,22 @@ def map_coordinates(
 
 
 @_wraps(scipy.ndimage.affine_transform, lax_description=textwrap.dedent("""\
-	Only linear interpolation (``order=1``) and modes ``'nearest'`` are currently supported.
+	Only linear interpolation (``order=1``), modes ``'nearest'`` and cval = 0 are currently supported.
 	"""))
-def affine_transform(input, matrix, offset=0.0):
+def affine_transform(input, matrix, offset=0.0, order=1, mode='nearest', cval=0):
+  if order != 1:
+    raise NotImplementedError("order must be 1 (linear)")
+  if mode != 'nearest':
+    raise NotImplementedError("mode must be 'nearest'")
+  if cval != 0:
+    raise NotImplementedError("cval must be 0")
   # Convert to homogeneous transform
   if matrix.shape == [3,3]:
     H = matrix
   else:
-    H = np.zeros((3,3), dtype=np.float64)
-    H[2,2] = 1
-    H[:matrix.shape[0], :matrix.shape[1]] = matrix
-    H[:2,2] += offset
+    H = jnp.eye(3, dtype=matrix.dtype)
+    H = H.at[:2,:2].set(matrix)
+    H = H.at[:2, 2].set(offset)
 
-  O = lax.ndimage.affine_transform(I, H)
+  O = lax.affine_transform(input, H)
   return O

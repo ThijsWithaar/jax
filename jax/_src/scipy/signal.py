@@ -147,10 +147,14 @@ def detrend(data, axis=-1, type='linear', bp=0, overwrite_data=None):
       data = data.at[sl].add(-jnp.matmul(A, coef, precision=lax.Precision.HIGHEST))
     return jnp.moveaxis(data.reshape(shape), 0, axis)
 
+
 @_wraps(osp_signal.lfilter)
 def lfilter(b, a, x, axis = -1, zi = None):
+  if z_i is not None:
+    raise NotImplementedError("Initial conditions for filter not implemented")
   y = lax.lfilter(b, a, x)
   return y
+
 
 @_wraps(osp_signal.filtfilt)
 def filtfilt(b, a, x, axis = -1):
