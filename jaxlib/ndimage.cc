@@ -36,24 +36,24 @@ struct coordinate
 
 struct ndimage_descriptor
 {
-	ptrdiff_t h, w;
+	ptrdiff_t w, h;
 };
 
-py::bytes BuildNdImageDescriptor(ptrdiff_t h, ptrdiff_t w)
+py::bytes BuildNdImageDescriptor(ptrdiff_t w, ptrdiff_t h)
 {
-	return PackDescriptor<ndimage_descriptor>({h, w});
+	return PackDescriptor<ndimage_descriptor>({w, h});
 }
 
 // Homogeneous coordinate projection
-coordinate<double> project(const double* pH, coordinate<ptrdiff_t> ci)
+coordinate<double> project(const float* pH, coordinate<ptrdiff_t> ci)
 {
 	std::array<double, 3> o{0,0,0};
 	for(size_t n=0; n<3; n++)
 	{
-		o[n] = ci.x*pH[0] + ci.x*pH[1] + pH[2];
+		o[n] = ci.y*pH[0] + ci.x*pH[1] + pH[2];
 		pH += 3;
 	}
-	return {o[0]/o[2], o[1]/o[2]};
+	return {o[1]/o[2], o[0]/o[2]};
 }
 
 // Bi-linear pixel interpolation
@@ -70,6 +70,8 @@ T interp_linear(const T* pI, const ndimage_descriptor& s, coordinate<double> c)
 	T_real yi, xi;
 	const T_real xf = std::modf(c.x, &xi);
 	const T_real yf = std::modf(c.y, &yi);
+	
+	return fetch(xi, yi);	// Debug: Return coordinates
 
 	T vu = fetch(xi, yi  )*(1-xf) + fetch(xi+1, yi  )*xf;
 	T vd = fetch(xi, yi+1)*(1-xf) + fetch(xi+1, yi+1)*xf;
@@ -81,8 +83,17 @@ void affine_transform(void* out, void** in)
 {
 	const ndimage_descriptor s = **UnpackDescriptor<ndimage_descriptor>(reinterpret_cast<const char*>(in[0]), sizeof(ndimage_descriptor));
 	const T* pI = reinterpret_cast<const T*>(in[1]);
-	const double* pH = reinterpret_cast<const double*>(in[2]);
+	const float* pH = reinterpret_cast<const float*>(in[2]);
 	T* pO = reinterpret_cast<T*>(out);
+	
+	std::cout << "s = " << s.w << ", " << s.h << std::endl;
+	std::cout << "H = " << std::endl;
+	for(size_t m=0; m<3; m++)
+	{
+		for(size_t n=0; n<3; n++)
+			std::cout << pH[n+3*m] << " ";
+		std::cout << std::endl;
+	}
 
 	coordinate<ptrdiff_t> co;
 	for(co.y=0; co.y < s.h; co.y++)
@@ -90,7 +101,8 @@ void affine_transform(void* out, void** in)
 		for(co.x=0; co.x < s.w; co.x++)
 		{
 			coordinate<double> ci = project(pH, co);
-			pO[co.y*s.w + co.x] = interp_linear(pI, s, ci);
+			pO[co.y*s.w + co.x] = interp_linear(pI, s, {co.x+1, co.y});
+			//pO[co.y*s.w + co.x] = pI[co.y*s.w + co.x];
 		}
 	}
 }

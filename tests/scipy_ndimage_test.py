@@ -59,6 +59,21 @@ def _fixed_ref_map_coordinates(input, coordinates, order, mode, cval=0.0):
 
 @jtu.with_config(jax_numpy_rank_promotion="raise")
 class NdimageTest(jtu.JaxTestCase):
+  def testAffineTransform(self):
+    I = np.zeros((5,7))
+    I[2:4, 3] = 1.
+    I[2, 4] = 2.
+    print('I = \n', I.round(3))
+
+    M = np.array([[1, 0], [0, 1]], dtype=np.float32)
+    O = np.array([1, 2], dtype=np.float32)
+
+    Osc = osp_ndimage.affine_transform(I, M, O)
+    print('Osc = \n', Osc.round(3))
+    Olax= lsp_ndimage.affine_transform(I, M, O)
+    print('Olax = \n', Olax.round(3))
+
+    assert(False)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}_coordinates={}_order={}_mode={}_cval={}_impl={}_round={}".format(

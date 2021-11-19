@@ -144,10 +144,9 @@ def affine_transform(input, matrix, offset=0.0):
   if matrix.shape == [3,3]:
     H = matrix
   else:
-    H = np.zeros((3,3), dtype=np.float64)
-    H[2,2] = 1
-    H[:matrix.shape[0], :matrix.shape[1]] = matrix
-    H[:2,2] += offset
+    H = jnp.eye(3, dtype=matrix.dtype)
+    H = H.at[:2,:2].set(matrix)
+    H = H.at[:2, 2].set(offset)
 
-  O = lax.ndimage.affine_transform(I, H)
+  O = lax.affine_transform(input, H)
   return O
