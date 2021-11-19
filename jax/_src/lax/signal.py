@@ -1,5 +1,6 @@
 from jax.core import Primitive
 from jax.interpreters import ad
+from jax.interpreters import batching
 from jax.interpreters import xla
 from jax._src.lib import signal
 
