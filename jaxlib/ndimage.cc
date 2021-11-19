@@ -11,12 +11,6 @@ namespace jax {
 namespace {
 
 template<typename T>
-T clamp(T v, T lo, T hi)
-{
-	std::min(std::max(v, lo), hi);
-}
-
-template<typename T>
 struct remove_complex
 {
 	using type = T;
@@ -27,6 +21,12 @@ struct remove_complex<std::complex<T>>
 {
 	using type = T;
 };
+
+template<typename T>
+T clamp(T v, T lo, T hi)
+{
+	std::min<T>(std::max<T>(v, lo), hi);
+}
 
 template<typename T>
 struct coordinate
@@ -62,17 +62,17 @@ T interp_linear(const T* pI, const ndimage_descriptor& s, coordinate<double> c)
 {
 	using T_real = typename remove_complex<T>::type;
 
-	auto fetch = [&](ptrdiff_t x, ptrdiff_t y)
+	auto fetch = [pI, &s](ptrdiff_t x, ptrdiff_t y) -> const T&
 	{
-		return clamp<ptrdiff_t>(x, 0, s.w-1) + s.w*clamp<ptrdiff_t>(y, 0, s.h-1);
+		ptrdiff_t xc = std::min<ptrdiff_t>(std::max<ptrdiff_t>(0, x), s.w-1);
+		ptrdiff_t yc = std::min<ptrdiff_t>(std::max<ptrdiff_t>(0, y), s.h-1);
+		return pI[yc*s.w + xc];
 	};
 
 	T_real yi, xi;
 	const T_real xf = std::modf(c.x, &xi);
 	const T_real yf = std::modf(c.y, &yi);
 	
-	return fetch(xi, yi);	// Debug: Return coordinates
-
 	T vu = fetch(xi, yi  )*(1-xf) + fetch(xi+1, yi  )*xf;
 	T vd = fetch(xi, yi+1)*(1-xf) + fetch(xi+1, yi+1)*xf;
 	return vu*(1-yf) + vd*yf;
@@ -86,8 +86,6 @@ void affine_transform(void* out, void** in)
 	const float* pH = reinterpret_cast<const float*>(in[2]);
 	T* pO = reinterpret_cast<T*>(out);
 	
-	std::cout << "s = " << s.w << ", " << s.h << std::endl;
-	std::cout << "H = " << std::endl;
 	for(size_t m=0; m<3; m++)
 	{
 		for(size_t n=0; n<3; n++)
@@ -101,8 +99,7 @@ void affine_transform(void* out, void** in)
 		for(co.x=0; co.x < s.w; co.x++)
 		{
 			coordinate<double> ci = project(pH, co);
-			pO[co.y*s.w + co.x] = interp_linear(pI, s, {co.x+1, co.y});
-			//pO[co.y*s.w + co.x] = pI[co.y*s.w + co.x];
+			pO[co.y*s.w + co.x] = interp_linear<T>(pI, s, ci);
 		}
 	}
 }

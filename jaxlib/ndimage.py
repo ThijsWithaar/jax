@@ -18,7 +18,7 @@ def affine_transform(ctx, input, htransform):
   arr_shape_h = xla_client.Shape.array_shape(h_dtype, h_shape, tuple(range(len(h_shape) - 1, -1, -1)))
   arr_shape_o = arr_shape_i
 
-  descriptor_bytes = _ndimage.build_ndimage_descriptor(i_shape[0], i_shape[1])
+  descriptor_bytes = _ndimage.build_ndimage_descriptor(i_shape[1], i_shape[0])
 
   op_name = {
     np.dtype('float32')   : b"affine_transform_f32",
