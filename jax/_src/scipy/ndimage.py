@@ -147,7 +147,7 @@ def affine_transform(input, matrix, offset=0.0, order=1, mode='nearest', cval=0)
   if cval != 0:
     raise NotImplementedError("cval must be 0")
   # Convert to homogeneous transform
-  if matrix.shape == [3,3]:
+  if matrix.shape == (3,3):
     H = matrix
   else:
     H = jnp.eye(3, dtype=matrix.dtype)

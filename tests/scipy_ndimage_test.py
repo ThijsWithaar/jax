@@ -21,7 +21,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import scipy.ndimage as osp_ndimage
 
-from jax import grad
+from jax import grad, jacfwd, jvp
 from jax._src import test_util as jtu
 from jax import dtypes
 from jax.scipy import ndimage as lsp_ndimage
@@ -78,6 +78,51 @@ class NdimageTest(jtu.JaxTestCase):
     O = np.array([-.1, +.2], dtype=np.float32)
     args_maker = lambda: [I, M, O]
     self._CheckAgainstNumpy(osp_op, lsp_op, args_maker, tol=1e-6)
+
+  def testAffineTransform_JVP(self):
+    Y, X = np.mgrid[:5, :7]
+    alpha = .2
+    x0 = 2; y0 = 1
+    G = 9 * np.exp(-alpha * ((X-x0)**2 + (Y-y0)**2)).astype(np.float32)
+    print("G = ", G.round(2))
+
+    H = np.array([
+        [1.1, 0  , 0],
+        [0  , 1.0, 0],
+        [0  , 0  , 1]
+    ], dtype=np.float32)
+
+    def jvp_num(dH):
+        eps = 1e-6
+        dy = lsp_ndimage.affine_transform(G, H + eps*dH) - lsp_ndimage.affine_transform(G, H - eps*dH)
+        return dy / (2*eps)
+
+    #y = lsp_ndimage.affine_transform(G, H)
+
+    dx = np.array([
+        [0,0,0],
+        [0,0,1],
+        [0,0,0]
+    ], dtype=np.float32)
+
+    dy = np.array([
+        [0,0,1],
+        [0,0,0],
+        [0,0,0]
+    ], dtype=np.float32)
+
+    for m in range(2,3):
+        for n in range(3):
+            dH = np.zeros_like(H)
+            dH[m,n] = 1
+            _, df_dH = jvp(lsp_ndimage.affine_transform, (G, H), (0*G, dH))
+            df_dH_num = jvp_num(dH)
+            print("\ndf/dH%i,%i =\n" % (m,n), df_dH.round(0))
+            print("df/dH%i,%i (num)=\n" % (m,n), df_dH_num.round(0))
+
+            # Derivatives at border don't match
+            #self.assertAllClose(df_dH[1:-1,1:-1], df_dH_num[1:-1,1:-1], atol=2)
+    assert(False)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}_coordinates={}_order={}_mode={}_cval={}_impl={}_round={}".format(

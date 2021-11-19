@@ -86,13 +86,6 @@ void affine_transform(void* out, void** in)
 	const float* pH = reinterpret_cast<const float*>(in[2]);
 	T* pO = reinterpret_cast<T*>(out);
 	
-	for(size_t m=0; m<3; m++)
-	{
-		for(size_t n=0; n<3; n++)
-			std::cout << pH[n+3*m] << " ";
-		std::cout << std::endl;
-	}
-
 	coordinate<ptrdiff_t> co;
 	for(co.y=0; co.y < s.h; co.y++)
 	{
