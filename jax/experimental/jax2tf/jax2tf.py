@@ -20,21 +20,23 @@ import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import jax
+from jax import lax
 from jax._src import ad_util
 from jax._src import api_util
 from jax import config
 from jax._src import api
 from jax import core, custom_derivatives
+from jax._src import dispatch
 from jax._src import dtypes
 from jax import linear_util as lu
 from jax import random, tree_util
 from jax import numpy as jnp
+from jax._src.lax import control_flow as lax_control_flow
+from jax._src.lax import lax as lax_internal
+from jax._src.lax import linalg as lax_linalg
+from jax._src.lax import slicing as lax_slicing
 from jax._src import source_info_util
 from jax._src import util
-from jax._src.lax import control_flow as lax_control_flow
-from jax._src.lax import fft as lax_fft
-from jax._src.lax import lax
-from jax._src.lax import linalg as lax_linalg
 import jax._src.prng
 import jax._src.random
 from jax.experimental import maps
@@ -46,9 +48,9 @@ from jax.interpreters import sharded_jit
 from jax.interpreters import xla
 from jax._src.lib import xla_client
 
-from . import shape_poly
-from . import shape_poly_tf
-from . import impl_no_xla
+from jax.experimental.jax2tf import shape_poly
+from jax.experimental.jax2tf import shape_poly_tf
+from jax.experimental.jax2tf import impl_no_xla
 
 import numpy as np
 import tensorflow as tf  # type: ignore[import]
@@ -63,6 +65,13 @@ from tensorflow.python.framework import ops as tf_ops  # type: ignore[import]
 # pylint: enable=g-direct-tensorflow-import
 
 PolyShape = shape_poly.PolyShape
+
+# A temporary internal flag, to enable the wrapping of jax.jit functions
+# with tf.function(jit_compile=True). See #7389. This change has triggered a
+# number of failures in TF. We keep this until we are confident that it does
+# not create problems.
+# TODO(b/207464757): figure out why this change breaks test
+_WRAP_JAX_JIT_WITH_TF_FUNCTION = False
 
 # The scope name need to be a valid TensorFlow name. See
 # https://github.com/tensorflow/tensorflow/blob/r2.3/tensorflow/core/framework/node_def_util.cc#L731
@@ -482,6 +491,22 @@ def _interpret_fun(
     extra_name_stack: Optional[str],
     fresh_constant_cache: bool = False
 ) -> Sequence[Tuple[TfVal, core.ShapedArray]]:
+  with core.new_base_main(TensorFlowTrace) as main:  # type: ignore
+    fun = _interpret_subtrace(fun, main, in_avals)
+    with _extended_name_stack(extra_name_stack):
+      with core.new_sublevel():
+          out_vals: Sequence[Tuple[TfVal, core.ShapedArray]] = \
+              _call_wrapped_with_new_constant_cache(fun, in_vals,
+                                                    fresh_constant_cache=fresh_constant_cache)
+
+      del main
+
+  return tuple(out_vals)
+
+def _call_wrapped_with_new_constant_cache(fun: lu.WrappedFun,
+                                          in_vals: Sequence[TfVal],
+                                          fresh_constant_cache: bool = False
+                                          ) -> Sequence[Tuple[TfVal, core.ShapedArray]]:
   try:
     prev_constant_cache = _thread_local_state.constant_cache
     prev_constant_cache_keys = set(prev_constant_cache.keys()) if prev_constant_cache is not None else set()
@@ -490,13 +515,8 @@ def _interpret_fun(
     if fresh_constant_cache:
       _thread_local_state.constant_cache = {}
 
-    with core.new_base_main(TensorFlowTrace) as main:  # type: ignore
-      fun = _interpret_subtrace(fun, main, in_avals)
-      with _extended_name_stack(extra_name_stack):
-        with core.new_sublevel():
-          out_vals: Sequence[Tuple[TfVal, core.ShapedArray]] = \
-              fun.call_wrapped(*in_vals)
-        del main
+    out_vals: Sequence[Tuple[TfVal, core.ShapedArray]] = \
+        fun.call_wrapped(*in_vals)
   finally:
     if prev_constant_cache is not None and not fresh_constant_cache:
       newly_added_keys = set(prev_constant_cache.keys()) - prev_constant_cache_keys
@@ -504,9 +524,7 @@ def _interpret_fun(
       for k in newly_added_keys:
         del prev_constant_cache[k]
     _thread_local_state.constant_cache = prev_constant_cache
-
-  return tuple(out_vals)
-
+  return out_vals
 
 def _convert_jax_impl(jax_impl: Callable, *,
                       multiple_results=True,
@@ -852,6 +870,22 @@ class TensorFlowTrace(core.Trace):
                 fun.call_wrapped(*vals)
         elif call_primitive == sharded_jit.sharded_call_p:
           vals_out = _sharded_call(fun, vals, **params)
+        elif call_primitive == xla.xla_call_p:
+          if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+            # Make a nested tf.function(jit_compile=True)
+            store_tf_res_avals = None
+            def f_tf(*tf_args):
+              nonlocal store_tf_res_avals
+              tf_res_out: Sequence[Tuple[TfVal, core.ShapedArray]] = \
+                _call_wrapped_with_new_constant_cache(fun, tf_args,
+                                                      fresh_constant_cache=False)
+              tf_res_vals, tf_res_avals = util.unzip2(tf_res_out)
+              store_tf_res_avals = tf_res_avals
+              return tf_res_vals
+            tf_vals_out = tf.function(f_tf, autograph=False, jit_compile=True)(*vals)
+            vals_out = zip(tf_vals_out, store_tf_res_avals)
+          else:
+            vals_out = fun.call_wrapped(*vals)
         else:
           vals_out = fun.call_wrapped(*vals)
     return [TensorFlowTracer(self, v, a) for v, a in vals_out]
@@ -968,7 +1002,7 @@ def _add(x: TfVal, y: TfVal) -> TfVal:
 
 
 tf_impl[ad_util.add_jaxvals_p] = _add
-tf_impl[xla.device_put_p] = lambda x, device=None: x
+tf_impl[dispatch.device_put_p] = lambda x, device=None: x
 
 def _neg(x: TfVal) -> TfVal:
   if x.dtype.is_unsigned:
@@ -1012,7 +1046,7 @@ def _round(operand, *, rounding_method,
                  tf.math.round(operand)) + floor)
   else:  # rounding_method is RoundingMethod.TO_NEAREST_EVEN
     rounding_fun = _convert_jax_impl(
-        lax._round_to_nearest_even, multiple_results=False)
+        lax_internal._round_to_nearest_even, multiple_results=False)
     return rounding_fun(operand, _in_avals=_in_avals, _out_aval=_out_aval)
 
 tf_impl_with_avals[lax.round_p] = _round
@@ -1067,12 +1101,12 @@ tf_impl[lax.sin_p] = tf.math.sin
 tf_impl[lax.sinh_p] = tf.math.sinh
 tf_impl[lax.cos_p] = tf.math.cos
 tf_impl[lax.cosh_p] = tf.math.cosh
-tf_impl_with_avals[lax.acos_p] = _convert_jax_impl(lax.acos_translation_rule,
-                                                   multiple_results=False)
-tf_impl_with_avals[lax.asin_p] = _convert_jax_impl(lax.asin_translation_rule,
-                                                   multiple_results=False)
-tf_impl_with_avals[lax.atan_p] = _convert_jax_impl(lax.atan_translation_rule,
-                                                   multiple_results=False)
+tf_impl_with_avals[lax.acos_p] = _convert_jax_impl(
+    lax_internal.acos_translation_rule, multiple_results=False)
+tf_impl_with_avals[lax.asin_p] = _convert_jax_impl(
+    lax_internal.asin_translation_rule, multiple_results=False)
+tf_impl_with_avals[lax.atan_p] = _convert_jax_impl(
+    lax_internal.atan_translation_rule, multiple_results=False)
 
 def _atan2(y, x, **kwargs):
   if x.dtype.is_complex or y.dtype.is_complex:
@@ -1173,8 +1207,8 @@ def _minmax(x: TfVal, y: TfVal, *, is_min: bool,
   # For complex numbers use lexicographic ordering, like JAX
   if dtypes.issubdtype(x.dtype.as_numpy_dtype, np.complexfloating):
     return _convert_jax_impl(
-        partial(lax._minmax_complex_lowering,
-                          lax_cmp_pick_x=lax.lt if is_min else lax.gt),
+        partial(lax_internal._minmax_complex_lowering,
+                lax_cmp_pick_x=lax.lt if is_min else lax.gt),
         multiple_results=False)(x, y, _in_avals=_in_avals, _out_aval=_out_aval)
   elif x.dtype.as_numpy_dtype == np.bool_:
     return (tf.math.logical_and if is_min else tf.math.logical_or)(x, y)
@@ -1361,7 +1395,7 @@ tf_impl[lax.gt_p] = bool_to_int8(tf.math.greater, argnums=(0, 1))
 tf_impl[lax.le_p] = bool_to_int8(tf.math.less_equal, argnums=(0, 1))
 tf_impl[lax.lt_p] = bool_to_int8(tf.math.less, argnums=(0, 1))
 
-tf_impl[lax_linalg.cholesky_p] = tf.linalg.cholesky
+tf_impl[lax.linalg.cholesky_p] = tf.linalg.cholesky
 
 
 def _convert_element_type(operand, *, new_dtype, weak_type=False):
@@ -1469,6 +1503,8 @@ def _conv_general_dilated(lhs, rhs, *,
         use_v2=True)
     # TODO: implement shape inference for XlaConv
     out.set_shape(out_tf_shape)
+    if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+      out = tf.stop_gradient(out)  # See #7839
     return out
 
   # Follow the lowering for complex convolutions from
@@ -1517,6 +1553,8 @@ def _dot_general(lhs, rhs, *, dimension_numbers,
       precision_config_proto,
       preferred_element_type=preferred_element_type,
       use_v2=True)
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    res = tf.stop_gradient(res)  # See #7839
   return res
 
 
@@ -1566,6 +1604,8 @@ def _pad(operand, padding_value, *, padding_config,
          _out_aval: core.ShapedArray):
   low, high, interior = util.unzip3(padding_config)
   out = tfxla.pad(operand, padding_value, low, high, interior)
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    out = tf.stop_gradient(out)  # See #7839
   return out
 
 
@@ -1608,14 +1648,14 @@ def _argminmax(is_min: bool, operand: TfVal, axes: Sequence[int],
   if is_min:
     extra_name_stack = "argmin"
     value_comparator = lax.lt
-    get_identity = lax._get_min_identity
+    get_identity = lax_internal._get_min_identity
   else:
     extra_name_stack = "argmax"
     value_comparator = lax.gt
-    get_identity = lax._get_max_identity
+    get_identity = lax_internal._get_max_identity
 
   res = _convert_jax_impl(
-      partial(lax._compute_argminmax, value_comparator, get_identity),
+      partial(lax_internal._compute_argminmax, value_comparator, get_identity),
       multiple_results=False,
       extra_name_stack=extra_name_stack)(
           operand,
@@ -1655,8 +1695,8 @@ def _select_and_gather_add(
   const = lambda dtype, x: tf.constant(np.array(x), dtype)
 
   if double_word_reduction:
-    word_dtype = lax._UINT_DTYPES[nbits]
-    double_word_dtype = lax._UINT_DTYPES[nbits * 2]
+    word_dtype = lax_internal._UINT_DTYPES[nbits]
+    double_word_dtype = lax_internal._UINT_DTYPES[nbits * 2]
 
     # Packs two values into a tuple.
     def pack(a, b):
@@ -1737,17 +1777,19 @@ def _common_reduce_window(operand, init_val, reducer, window_dimensions,
       padding=padding)
   # TODO: implement shape inference for XlaReduceWindow
   out.set_shape(_aval_to_tf_shape(_out_aval))
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    out = tf.stop_gradient(out)  # See #7839
   return out
 
 
-def _reduce_window(operand, init_value, *, jaxpr, consts, window_dimensions,
+def _reduce_window(*args, jaxpr, consts, window_dimensions,
                    window_strides, padding, base_dilation, window_dilation,
                    _in_avals, _out_aval):
   """TensorFlow implementation of reduce_window.
 
   Args:
-    operand: N dimensional array containing elements of type T
-    init_value: starting value of the reduction
+    operands: N dimensional arrays containing elements of type T
+    init_values: starting values of the reduction
     jaxpr: the jaxpr corresponding to the reduction function
     consts: the constants associated with jaxpr.
     window_dimensions: array of integers for window dimension values
@@ -1760,15 +1802,20 @@ def _reduce_window(operand, init_value, *, jaxpr, consts, window_dimensions,
     The reduced operand.
   """
   assert len(consts) == 0, "Reduction computation cannot have constants"
+  operands, init_values = util.split_list(args, [len(args) // 2])
+
+  if len(operands) != 1:
+    raise NotImplementedError("jax2tf does not support variadic reduce_window")
 
   def reducer(arg1: TfVal, arg2: TfVal) -> TfVal:
     closed_jaxpr = core.ClosedJaxpr(jaxpr, consts)
     res, = _interpret_jaxpr(closed_jaxpr, arg1, arg2, extra_name_stack=None)
     return res
 
-  return _common_reduce_window(operand, init_value, reducer, window_dimensions,
-                               window_strides, padding, base_dilation,
-                               window_dilation, _in_avals, _out_aval)
+  return (_common_reduce_window(operands[0], init_values[0], reducer,
+                                window_dimensions, window_strides, padding,
+                                base_dilation, window_dilation, _in_avals,
+                                _out_aval[0]),)
 
 
 
@@ -1880,24 +1927,26 @@ def _reduce(*operands: TfVal,
       tf.function(reducer_computation,
                   autograph=False).get_concrete_function(*reducer_arg_spec))
 
-  out = tfxla.variadic_reduce(operands, init_vals,
-                              dimensions_to_reduce=dimensions,
-                              reducer=xla_reducer_computation)
-  return out
+  outs = tfxla.variadic_reduce(operands, init_vals,
+                               dimensions_to_reduce=dimensions,
+                               reducer=xla_reducer_computation)
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    outs = tuple(tf.stop_gradient(out) for out in outs)  # See #7839
+  return outs
 
 tf_impl_with_avals[lax.reduce_p] = _reduce
 
 
-# We use lax_control_flow._cumred_tpu_translation_rule to convert cummax,
+# We use lax._cumred_tpu_translation_rule to convert cummax,
 # cummin, cumsum and cumprod. This is efficient on TPU, but the complexity is
 # O(n^2) on other backends. This may be implemented using associative_scan
 # instead to favor different backends.
-tf_impl_with_avals[lax_control_flow.cummin_p] = _convert_jax_impl(
+tf_impl_with_avals[lax.cummin_p] = _convert_jax_impl(
     partial(lax_control_flow._cumred_tpu_translation_rule,
             lax._reduce_window_min),
     multiple_results=False,
     extra_name_stack="cummin")
-tf_impl_with_avals[lax_control_flow.cummax_p] = _convert_jax_impl(
+tf_impl_with_avals[lax.cummax_p] = _convert_jax_impl(
     partial(lax_control_flow._cumred_tpu_translation_rule,
             lax._reduce_window_max),
     multiple_results=False,
@@ -1907,12 +1956,12 @@ tf_impl_with_avals[lax_control_flow.cummax_p] = _convert_jax_impl(
 # will fail when running in compiled mode, but are otherwise compatible with
 # the operation. A non-XLA path can thus be defined for all dtypes, though the
 # tests will crash.
-tf_impl_with_avals[lax_control_flow.cumsum_p] = _convert_jax_impl(
+tf_impl_with_avals[lax.cumsum_p] = _convert_jax_impl(
     partial(lax_control_flow._cumred_tpu_translation_rule,
             lax._reduce_window_sum),
     multiple_results=False,
     extra_name_stack="cumsum")
-tf_impl_with_avals[lax_control_flow.cumprod_p] = _convert_jax_impl(
+tf_impl_with_avals[lax.cumprod_p] = _convert_jax_impl(
     partial(lax_control_flow._cumred_tpu_translation_rule,
             lax._reduce_window_prod),
     multiple_results=False,
@@ -1940,6 +1989,8 @@ def _select_and_scatter_add(source, operand, *, select_prim, window_dimensions,
                                  padding, source, init_value, select_fn,
                                  scatter_fn)
   out.set_shape(_aval_to_tf_shape(_out_aval))
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    out = tf.stop_gradient(out)  # See #7839
   return out
 
 
@@ -1963,7 +2014,7 @@ tf_impl_with_avals[random.random_gamma_p] = _convert_jax_impl(
     multiple_results=False, extra_name_stack="random_gamma")
 
 
-def _rng_bit_generator(key: TfVal, *, shape, dtype, algorithm):
+def _rng_bit_generator(key: TfVal, *, shape, dtype, algorithm) -> Sequence[TfVal]:
   shape_tf = _eval_shape(shape)
   # JAX uses XLA algorithm enums; tfxla uses tf.random.Algorithm
   if algorithm == lax.RandomAlgorithm.RNG_THREE_FRY:
@@ -1974,9 +2025,11 @@ def _rng_bit_generator(key: TfVal, *, shape, dtype, algorithm):
     algorithm_tf = tf.random.Algorithm.AUTO_SELECT
   else:
     assert False
-  out = tfxla.rng_bit_generator(algorithm_tf.value, key, shape_tf,
-                                dtype=_to_tf_dtype(dtype))
-  return out
+  outs = tfxla.rng_bit_generator(algorithm_tf.value, key, shape_tf,
+                                 dtype=_to_tf_dtype(dtype))
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    outs = tuple(tf.stop_gradient(out) for out in outs) # See #7839
+  return outs
 
 
 tf_impl[lax.rng_bit_generator_p] = _rng_bit_generator
@@ -1999,7 +2052,8 @@ def _gather(operand, start_indices, *, dimension_numbers, slice_sizes: core.Shap
             _out_aval: core.ShapedArray):
   """Tensorflow implementation of gather."""
   if mode == lax.GatherScatterMode.FILL_OR_DROP:
-    gather_fill_fn = _convert_jax_impl(lax._gather_fill, multiple_results=False)
+    gather_fill_fn = _convert_jax_impl(lax_slicing._gather_fill,
+                                       multiple_results=False)
     return gather_fill_fn(
         operand, start_indices, dimension_numbers=dimension_numbers,
         slice_sizes=slice_sizes, unique_indices=unique_indices,
@@ -2011,6 +2065,8 @@ def _gather(operand, start_indices, *, dimension_numbers, slice_sizes: core.Shap
   out = tfxla.gather(operand, start_indices, proto, slice_sizes_tf,
                      indices_are_sorted)
   out.set_shape(_aval_to_tf_shape(_out_aval))
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    out = tf.stop_gradient(out)  # See #7839
   return out
 
 
@@ -2041,6 +2097,8 @@ def _dynamic_slice(operand, *start_indices, slice_sizes: core.Shape,
   slice_sizes_tf = _eval_shape(slice_sizes)
 
   res = tfxla.dynamic_slice(operand, start_indices, size_indices=slice_sizes_tf)
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    res = tf.stop_gradient(res)  # See #7839
   return res
 
 
@@ -2050,7 +2108,10 @@ tf_impl_with_avals[lax.dynamic_slice_p] = _dynamic_slice
 def _dynamic_update_slice(operand, update, *start_indices,
                           _in_avals: Sequence[core.ShapedArray],
                           _out_aval: core.ShapedArray):
-  return tfxla.dynamic_update_slice(operand, update, tf.stack(start_indices))
+  out = tfxla.dynamic_update_slice(operand, update, tf.stack(start_indices))
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    out = tf.stop_gradient(out)  # See #7839
+  return out
 
 
 tf_impl_with_avals[lax.dynamic_update_slice_p] = _dynamic_update_slice
@@ -2096,6 +2157,8 @@ def _scatter(operand, scatter_indices, updates, *, update_jaxpr, update_consts,
       xla_update_computation,
       proto,
       indices_are_sorted=indices_are_sorted)
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    out = tf.stop_gradient(out)  # See #7839
   return out
 
 
@@ -2120,7 +2183,7 @@ def _cond(index: TfVal, *operands: TfVal, branches: Sequence[core.ClosedJaxpr],
   return tf.switch_case(index, branches_tf)
 
 
-tf_impl[lax_control_flow.cond_p] = _cond
+tf_impl[lax.cond_p] = _cond
 
 
 def _while(*args: TfVal, cond_nconsts: int, cond_jaxpr: core.ClosedJaxpr,
@@ -2200,10 +2263,10 @@ def _batched_cond_while(*args: TfVal, cond_nconsts: int,
   return res_carry
 
 
-tf_impl[lax_control_flow.while_p] = _while
+tf_impl[lax.while_p] = _while
 
 # We use the scan impl rule to rewrite in terms of while.
-tf_impl_with_avals[lax_control_flow.scan_p] = _convert_jax_impl(
+tf_impl_with_avals[lax.scan_p] = _convert_jax_impl(
     lax_control_flow._scan_impl,
     extra_name_stack="scan")
 
@@ -2253,7 +2316,7 @@ def _sort(*operands: TfVal, dimension: int, is_stable: bool,
   # corresponding to two scalars from operand[k].
   def lexicographic_comparator(*tf_args: TfVal) -> TfVal:
     return _convert_jax_impl(
-        lax._sort_lt_comparator, multiple_results=False)(
+        lax_internal._sort_lt_comparator, multiple_results=False)(
             *tf_args,
             _in_avals=comparator_jax_in_avals,
             _out_aval=core.ShapedArray((), np.bool_),
@@ -2267,6 +2330,8 @@ def _sort(*operands: TfVal, dimension: int, is_stable: bool,
       dimension=dimension,
       is_stable=is_stable,
       comparator=xla_comparator_computation)
+  if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
+    results = tuple(tf.stop_gradient(out) for out in results)  # See #7839
   return results
 
 
@@ -2292,14 +2357,14 @@ def _fft(x, fft_type, fft_lengths):
   return tf_funcs[fft_type][len(fft_lengths) - 1](x)
 
 
-tf_impl[lax_fft.fft_p] = _fft
+tf_impl[lax.fft_p] = _fft
 
 
 def _qr(operand, full_matrices):
   return tf.linalg.qr(operand, full_matrices=full_matrices)
 
 
-tf_impl[lax_linalg.qr_p] = _qr
+tf_impl[lax.linalg.qr_p] = _qr
 
 
 def _svd(operand, full_matrices, compute_uv):
@@ -2310,7 +2375,7 @@ def _svd(operand, full_matrices, compute_uv):
   return s, u, tf.linalg.adjoint(v)
 
 
-tf_impl[lax_linalg.svd_p] = _svd
+tf_impl[lax.linalg.svd_p] = _svd
 
 
 def _eig(operand: TfVal, compute_left_eigenvectors: bool,
@@ -2334,7 +2399,7 @@ def _eig(operand: TfVal, compute_left_eigenvectors: bool,
     return tuple([wHH, vl])
 
 
-tf_impl[lax_linalg.eig_p] = _eig
+tf_impl[lax.linalg.eig_p] = _eig
 
 
 def _eigh(operand: TfVal, lower: bool, _in_avals, _out_aval):
@@ -2353,7 +2418,7 @@ def _eigh(operand: TfVal, lower: bool, _in_avals, _out_aval):
   return v, w
 
 
-tf_impl_with_avals[lax_linalg.eigh_p] = _eigh
+tf_impl_with_avals[lax.linalg.eigh_p] = _eigh
 
 
 def _lu(operand: TfVal, _in_avals, _out_aval):
@@ -2361,7 +2426,7 @@ def _lu(operand: TfVal, _in_avals, _out_aval):
       operand, _in_avals=_in_avals, _out_aval=_out_aval)
 
 
-tf_impl_with_avals[lax_linalg.lu_p] = _lu
+tf_impl_with_avals[lax.linalg.lu_p] = _lu
 
 
 def _triangular_solve(a: TfVal, b: TfVal, *, left_side: bool, lower: bool,
@@ -2389,7 +2454,7 @@ def _triangular_solve(a: TfVal, b: TfVal, *, left_side: bool, lower: bool,
   return result
 
 
-tf_impl_with_avals[lax_linalg.triangular_solve_p] = _triangular_solve
+tf_impl_with_avals[lax.linalg.triangular_solve_p] = _triangular_solve
 
 
 def _linear_solve(*args: TfVal, const_lengths, jaxprs, _in_avals, _out_aval):
@@ -2402,7 +2467,7 @@ def _linear_solve(*args: TfVal, const_lengths, jaxprs, _in_avals, _out_aval):
       _out_aval=_out_aval)
 
 
-tf_impl_with_avals[lax_control_flow.linear_solve_p] = _linear_solve
+tf_impl_with_avals[lax.linear_solve_p] = _linear_solve
 
 def _tridiagonal_solve(*args: TfVal, _in_avals, _out_aval, **params):
   return _convert_jax_impl(lax_linalg._tridiagonal_solve_jax,
@@ -2413,7 +2478,7 @@ def _tridiagonal_solve(*args: TfVal, _in_avals, _out_aval, **params):
       _out_aval=_out_aval)
 
 
-tf_impl_with_avals[lax_linalg.tridiagonal_solve_p] = _tridiagonal_solve
+tf_impl_with_avals[lax.linalg.tridiagonal_solve_p] = _tridiagonal_solve
 
 def _custom_jvp_call_jaxpr(*args: TfVal, fun_jaxpr: core.ClosedJaxpr,
                            jvp_jaxpr_thunk: Callable,
@@ -2523,7 +2588,8 @@ def _pjit(*args: TfVal,
           resource_env: maps.ResourceEnv,
           donated_invars,
           name: str,
-          positional_semantics,
+          in_positional_semantics,
+          out_positional_semantics,
           _in_avals: Sequence[core.ShapedArray],
           _out_aval: core.ShapedArray) -> TfVal:
   del donated_invars

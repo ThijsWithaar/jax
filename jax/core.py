@@ -31,24 +31,24 @@ from weakref import ref
 
 import numpy as np
 
-from ._src import dtypes
-from ._src import config as jax_config
-from ._src.config import FLAGS, config
-from .errors import (ConcretizationTypeError, TracerArrayConversionError,
-                     TracerIntegerConversionError, UnexpectedTracerError)
-from . import linear_util as lu
+from jax._src import dtypes
+from jax._src import config as jax_config
+from jax._src.config import FLAGS, config
+from jax.errors import (ConcretizationTypeError, TracerArrayConversionError,
+                        TracerIntegerConversionError, UnexpectedTracerError)
+from jax import linear_util as lu
 
 from jax._src import source_info_util
-from ._src.util import (safe_zip, safe_map, curry, prod, tuple_insert,
+from jax._src.util import (safe_zip, safe_map, curry, prod, tuple_insert,
                         tuple_delete, cache, as_hashable_function,
                         HashableFunction)
 import jax._src.pretty_printer as pp
 
-from ._src import traceback_util
+from jax._src import traceback_util
 traceback_util.register_exclusion(__file__)
 
-zip = safe_zip
-map = safe_map
+zip, unsafe_zip = safe_zip, zip
+map, unsafe_map = safe_map, map
 
 
 # -------------------- jaxprs --------------------
@@ -76,12 +76,14 @@ class Jaxpr:
     self.eqns = list(eqns)
 
   def __str__(self):
-    return str(pp_jaxpr(self, JaxprPpContext()))
+    return str(pp_jaxpr(self, JaxprPpContext(), custom_pp_eqn_rules=True))
   __repr__ = __str__
 
-  def pretty_print(self, *, source_info=False, print_shapes=True, **kw):
+  def pretty_print(self, *, source_info=False, print_shapes=True,
+                   custom_pp_eqn_rules=True, **kw):
     doc = pp_jaxpr(self, JaxprPpContext(), source_info=source_info,
-                   print_shapes=print_shapes)
+                   print_shapes=print_shapes,
+                   custom_pp_eqn_rules=custom_pp_eqn_rules)
     return doc.format(**kw)
 
 
@@ -151,7 +153,9 @@ class JaxprEqn(NamedTuple):
   params: Dict[str, Any]
   source_info: source_info_util.SourceInfo
 
-  def __repr__(self): return str(pp_eqn(self, JaxprPpContext())).rstrip()
+  def __repr__(self):
+    return str(pp_eqn(self, JaxprPpContext(), custom_pp_eqn_rules=False)
+               ).rstrip()
 
 def new_jaxpr_eqn(invars, outvars, primitive, params, source_info=None):
   if primitive.call_primitive:
@@ -988,7 +992,7 @@ pytype_aval_mappings: Dict[type, Callable[[Any], AbstractValue]] = {}
 
 class Unit:
   def __repr__(self): return '*'
-unit = Unit()
+unit: Unit = Unit()
 literalable_types.add(Unit)
 
 class UnitVar(Var):
@@ -1024,8 +1028,6 @@ def concrete_or_error(force: Any, val: Any, context=""):
       raise ConcretizationTypeError(val, context)
   else:
     return force(val)
-
-convert_element_type_p = Primitive('convert_element_type')
 
 
 def _short_dtype_name(dtype):
@@ -1179,9 +1181,9 @@ class ConcreteArray(ShapedArray):
   __slots__ = ['val']
   array_abstraction_level = 0
 
-  def __init__(self, val, weak_type=False):
+  def __init__(self, val, weak_type=None):
     super().__init__(np.shape(val), np.result_type(val),
-                     weak_type=weak_type)
+                     weak_type=dtypes.is_weakly_typed(val) if weak_type is None else weak_type)
     # Note: canonicalized self.dtype doesn't necessarily match self.val
     self.val = val
     assert self.dtype != np.dtype('O'), val
@@ -1246,6 +1248,11 @@ class AbstractToken(AbstractValue):
   def at_least_vspace(self): return self
 
 abstract_token: AbstractToken = AbstractToken()
+
+# Concrete token object
+class Token(object): pass
+token: Token = Token()
+pytype_aval_mappings[Token] = lambda _: abstract_token
 
 
 def raise_to_shaped(aval: AbstractValue, weak_type=None):
@@ -1395,7 +1402,7 @@ def symbolic_equal_one_of_dim(d1: DimSize, dlist: Sequence[DimSize]) -> bool:
 
 def symbolic_equal_shape(s1: Shape, s2: Shape) -> bool:
   return (len(s1) == len(s2) and
-          all(map(symbolic_equal_dim, s1, s2)))
+          all(unsafe_map(symbolic_equal_dim, s1, s2)))
 
 def greater_equal_dim(d1: DimSize, d2: DimSize) -> bool:
   handler, ds = _dim_handler_and_canonical(d1, d2)
@@ -1660,11 +1667,11 @@ def call_impl(f: lu.WrappedFun, *args, **params):
   with new_sublevel():
     return f.call_wrapped(*args)
 
-call_p = CallPrimitive('call')
+call_p: CallPrimitive = CallPrimitive('call')
 call = call_p.bind
 call_p.def_impl(call_impl)
 
-named_call_p = CallPrimitive('named_call')
+named_call_p: CallPrimitive = CallPrimitive('named_call')
 named_call_p.def_impl(call_impl)
 
 # ------------------- Map -------------------
@@ -2114,24 +2121,29 @@ def pp_kv_pairs(kv_pairs, context: JaxprPpContext) -> pp.Doc:
     + pp.brk("") + pp.text("]")
   )
 
-def pp_eqn(eqn, context: JaxprPpContext, *, print_shapes=True, source_info=False
-          ) -> pp.Doc:
+def pp_eqn(eqn, context: JaxprPpContext, *, print_shapes=True,
+           source_info=False, custom_pp_eqn_rules=True) -> pp.Doc:
   lhs = pp_vars(eqn.outvars, context, print_shapes=print_shapes)
   annotation = (source_info_util.summarize(eqn.source_info)
                 if source_info else None)
-  return pp.concat([
-    lhs, pp.text(" = ", annotation=annotation), pp.text(eqn.primitive.name),
-    pp_kv_pairs(sorted(eqn.params.items()), context),
-    pp.text(" ") + pp_vars(eqn.invars, context)
-  ])
+  rule = pp_eqn_rules.get(eqn.primitive)
+  if rule and custom_pp_eqn_rules:
+    rhs = rule(eqn, context)
+  else:
+    rhs = [pp.text(eqn.primitive.name),
+           pp_kv_pairs(sorted(eqn.params.items()), context),
+           pp.text(" ") + pp_vars(eqn.invars, context)]
+  return pp.concat([lhs, pp.text(" = ", annotation=annotation), *rhs])
+CustomPpEqnRule = Callable[[JaxprEqn, JaxprPpContext], Sequence[pp.Doc]]
+pp_eqn_rules: Dict[Primitive, CustomPpEqnRule]  = {}
 
-
-def pp_eqns(eqns, context: JaxprPpContext, *, print_shapes=True, source_info=False
-           ) -> pp.Doc:
+def pp_eqns(eqns, context: JaxprPpContext, *, print_shapes=True,
+            source_info=False, custom_pp_eqn_rules=True
+            ) -> pp.Doc:
   return pp.join(
     pp.brk("; "),
-    map(lambda e: pp_eqn(e, context, print_shapes=print_shapes,
-                         source_info=source_info), eqns))
+    [pp_eqn(e, context, print_shapes=print_shapes, source_info=source_info,
+            custom_pp_eqn_rules=custom_pp_eqn_rules) for e in eqns])
 
 def pp_eqn_compact(primitive_name: str, params: Dict, context: JaxprPpContext
                   ) -> pp.Doc:
@@ -2159,9 +2171,10 @@ def pp_jaxpr_skeleton(jaxpr, eqns_fn, context: JaxprPpContext, *,
 
 
 def pp_jaxpr(jaxpr, context: JaxprPpContext, *, print_shapes=True,
-             source_info=False) -> pp.Doc:
+             source_info=False, custom_pp_eqn_rules=True) -> pp.Doc:
   eqns_fn = lambda: pp_eqns(jaxpr.eqns, context, print_shapes=print_shapes,
-                            source_info=source_info)
+                            source_info=source_info,
+                            custom_pp_eqn_rules=custom_pp_eqn_rules)
   return pp_jaxpr_skeleton(jaxpr, eqns_fn, context, print_shapes=print_shapes)
 
 def pp_jaxprs(jaxprs, context: JaxprPpContext) -> pp.Doc:

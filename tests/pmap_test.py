@@ -40,6 +40,7 @@ from jax import random
 from jax.core import ShapedArray
 from jax import (pmap, soft_pmap, jit, vmap, jvp, grad, make_jaxpr,
                  linearize, device_put)
+from jax._src import device_array
 import jax._src.lib
 from jax._src.lib import xla_bridge
 from jax._src.util import prod, safe_map
@@ -152,6 +153,70 @@ class PythonPmapTest(jtu.JaxTestCase):
 
     ans = f(x)
     self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def testLowerCompile(self):
+    f = self.pmap(lambda x: x - lax.pmean(x, 'i'), axis_name='i')
+    shape = (jax.device_count(), 4)
+    x = np.arange(prod(shape), dtype=np.float32).reshape(shape)
+    expected = f(x)
+    f_exe = f.lower(x).compile()
+    ans = f_exe(x)
+    self.assertAllClose(ans, expected)
+
+  def testLowerCompileInTreeMismatch(self):
+    f = self.pmap(lambda x: x - lax.pmean(x, 'i'), axis_name='i')
+    shape = (jax.device_count(), 4)
+    x = np.arange(prod(shape), dtype=np.float32).reshape(shape)
+    f_exe = f.lower(x).compile()
+    self.assertRaisesRegex(
+        TypeError, "function compiled for .*, called with .*",
+        lambda: f_exe([x]))
+
+  def testLowerCompileTrivial(self):
+    f = self.pmap(lambda x: x, axis_name='i')
+    x = np.arange(jax.device_count(), dtype=np.float32)
+    expected = f(x)
+    f_exe = f.lower(x).compile()
+    ans = f_exe(x)
+    self.assertAllClose(ans, expected)
+
+  def testLowerCompileTrivialInTreeMismatch(self):
+    f = self.pmap(lambda x: x, axis_name='i')
+    x = np.arange(jax.device_count(), dtype=np.float32)
+    f_exe = f.lower(x).compile()
+    self.assertRaisesRegex(
+        TypeError, "function compiled for .*, called with .*",
+        lambda: f_exe([x]))
+
+  def testLowerCompileArgTypeMismatch(self):
+    f = self.pmap(lambda x: x - lax.pmean(x, 'i'), axis_name='i')
+    shape = (jax.device_count(), 4)
+    x = np.arange(prod(shape), dtype=int).reshape(shape)
+    x_f32 = x.astype(jnp.float32)
+    x_i32 = x.astype(jnp.int32)
+    f_exe = f.lower(x_f32).compile()
+    self.assertRaisesRegex(
+        TypeError,
+        "Computation compiled for input types:\n.*float32.*\n"
+        "called with:\n.*int32.*",
+        lambda: f_exe(x_i32))
+
+  def testLowerCompileMultiArg(self):
+    f = self.pmap(lambda x, y: x - lax.pmean(y, 'i'), axis_name='i')
+    shape = (jax.device_count(), 4)
+    x = y = np.arange(prod(shape), dtype=np.float32).reshape(shape)
+    expected = f(x, y)
+    f_exe = f.lower(x, y).compile()
+    ans = f_exe(x, y)
+    self.assertAllClose(ans, expected)
+
+  def testLowerCompileTrivialMultiArg(self):
+    f = self.pmap(lambda x, y: (x, y), axis_name='i')
+    x = y = np.arange(jax.device_count(), dtype=np.float32)
+    expected = f(x, y)
+    f_exe = f.lower(x, y).compile()
+    ans = f_exe(x, y)
+    self.assertAllClose(ans, expected)
 
   def testMean(self):
     f = self.pmap(lambda x: x - lax.pmean(x, 'i'), axis_name='i')
@@ -540,12 +605,12 @@ class PythonPmapTest(jtu.JaxTestCase):
     y = f(x)
     self.assertIsInstance(y, jnp.ndarray)
     self.assertIsInstance(y, pxla.ShardedDeviceArray)
-    self.assertIsInstance(y, jax.interpreters.xla.DeviceArray)
+    self.assertIsInstance(y, device_array.DeviceArray)
     self.assertNotIsInstance(y, np.ndarray)
     self.assertAllClose(y, 2 * x, check_dtypes=False)
     z = f(y)
     self.assertIsInstance(z, pxla.ShardedDeviceArray)
-    self.assertIsInstance(z, jax.interpreters.xla.DeviceArray)
+    self.assertIsInstance(z, device_array.DeviceArray)
     self.assertNotIsInstance(z, np.ndarray)
     self.assertAllClose(z, 2 * 2 * x, check_dtypes=False)
 
@@ -2325,7 +2390,7 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
     sharded_x = pmap(lambda x: x)(x)
     self.assertIsNone(sharded_x._npy_value)
     for i in range(8):
-      self.assertIsInstance(sharded_x[i], jax.interpreters.xla.DeviceArray)
+      self.assertIsInstance(sharded_x[i], device_array.DeviceArray)
     self.assertIsNone(sharded_x._npy_value)
 
   def test_device_put_sharded_array(self):

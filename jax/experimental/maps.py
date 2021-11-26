@@ -23,31 +23,32 @@ from warnings import warn
 from functools import wraps, partial, partialmethod
 from enum import Enum
 
-from .. import numpy as jnp
-from .. import core
-from .. import linear_util as lu
-from .._src.api import _check_callable, _check_arg
-from ..tree_util import (tree_flatten, tree_unflatten, all_leaves, tree_map,
-                         tree_leaves)
-from .._src.tree_util import _replace_nones
-from .._src.api_util import (flatten_fun_nokwargs, flatten_axes,
-                             _ensure_index_tuple, donation_vector,
-                             shaped_abstractify)
-from .._src import source_info_util
-from .._src.config import config
-from ..errors import JAXTypeError
-from ..interpreters import partial_eval as pe
-from ..interpreters import pxla
-from ..interpreters import xla
-from ..interpreters import batching
-from ..interpreters import ad
+from jax import numpy as jnp
+from jax import core
+from jax import linear_util as lu
+from jax._src.api import Lowered, _check_callable, _check_arg
+from jax._src import dispatch
+from jax.tree_util import (tree_flatten, tree_unflatten, all_leaves, tree_map,
+                           tree_leaves)
+from jax._src.tree_util import _replace_nones
+from jax._src.api_util import (flatten_fun_nokwargs, flatten_axes,
+                               _ensure_index_tuple, donation_vector,
+                               shaped_abstractify)
+from jax._src import source_info_util
+from jax._src.config import config
+from jax.errors import JAXTypeError
+from jax.interpreters import partial_eval as pe
+from jax.interpreters import pxla
+from jax.interpreters import xla
+from jax.interpreters import batching
+from jax.interpreters import ad
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
-from .._src.util import (safe_map, safe_zip, HashableFunction,
-                         as_hashable_function, unzip2, distributed_debug_log,
-                         tuple_insert, moveaxis, split_list, wrap_name)
-from .._src.lax.parallel import _build_axis_index_lowering
-from .. import lax
+from jax._src.util import (safe_map, safe_zip, HashableFunction,
+                           as_hashable_function, unzip2, distributed_debug_log,
+                           tuple_insert, moveaxis, split_list, wrap_name)
+from jax._src.lax.parallel import _build_axis_index_lowering
+from jax import lax
 
 class _PositionalSemantics(Enum):
   """Indicates whether the positional shapes of inputs should be interpreted as
@@ -638,7 +639,7 @@ def xmap(fun: Callable,
       spmd_in_axes=None,
       spmd_out_axes_thunk=None,
       positional_semantics=_positional_semantics)
-    return fun_flat, args_flat, params, out_tree
+    return fun_flat, args_flat, params, in_tree, out_tree
 
   def verify_outputs(out_flat, out_tree, params):
     if has_output_rank_assertions:
@@ -651,7 +652,7 @@ def xmap(fun: Callable,
 
   def fun_mapped(*args):
     tree_map(_check_arg, args)
-    fun_flat, args_flat, params, out_tree = infer_params(*args)
+    fun_flat, args_flat, params, _, out_tree = infer_params(*args)
     out_flat = xmap_p.bind(fun_flat, *args_flat, **params)
     return verify_outputs(out_flat, out_tree, params)
 
@@ -661,13 +662,15 @@ def xmap(fun: Callable,
     return f
 
   def lower(*args):
-    fun_flat, args_flat, params, out_tree = infer_params(*args)
+    fun_flat, args_flat, params, in_tree, out_tree = infer_params(*args)
     avals_flat = [shaped_abstractify(arg) for arg in args_flat]
-    return make_xmap_callable(
+    computation = make_xmap_callable(
         fun_flat, params['name'], params['in_axes'], params['out_axes_thunk'],
         params['donated_invars'], params['global_axis_sizes'], params['axis_resources'],
         params['resource_env'], params['backend'], params['spmd_in_axes'],
         params['spmd_out_axes_thunk'], params['positional_semantics'], *avals_flat)
+    return Lowered(
+        computation, in_tree, out_tree(), donate_argnums, no_kwargs=True)
 
   fun_mapped = wraps(fun)(decorate_serial(fun_mapped))
   fun_mapped.lower = decorate_serial(lower)
@@ -735,7 +738,7 @@ def make_xmap_callable(fun: lu.WrappedFun,
         use_spmd_lowering, in_avals,
         tile_by_mesh_axes=True)
   else:
-    return xla.lower_xla_callable(
+    return dispatch.lower_xla_callable(
         f, None, backend, name, donated_invars, *((a, None) for a in in_avals))
 
 class EvaluationPlan(NamedTuple):

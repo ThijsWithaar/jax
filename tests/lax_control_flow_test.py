@@ -19,7 +19,6 @@ import itertools
 import operator
 import re
 import unittest
-import textwrap
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -36,7 +35,6 @@ from jax._src import test_util as jtu
 from jax import tree_util
 from jax._src.util import unzip2
 from jax.experimental import maps
-from jax.interpreters import xla
 import jax.numpy as jnp  # scan tests use numpy
 import jax.scipy as jsp
 
@@ -255,10 +253,11 @@ class LaxControlFlowTest(jtu.JaxTestCase):
       lax.while_loop(lambda c: True, lambda c: (1., 1.), 0.)
     with self.assertRaisesWithLiteralMatch(TypeError,
         ("body_fun output and input must have identical types, got\n"
-         "ShapedArray(bool[], weak_type=True)\n"
-         "and\n"
-         "ShapedArray(float32[]).")):
-      lax.while_loop(lambda c: True, lambda c: True, np.float32(0.))
+         "('ShapedArray(bool[], weak_type=True)', "
+         "'DIFFERENT ShapedArray(bool[], weak_type=True) vs. "
+         "ShapedArray(float32[])').")):
+      lax.while_loop(lambda c: True, lambda c: (True, True),
+                     (np.bool_(True), np.float32(0.)))
 
   def testNestedWhileWithDynamicUpdateSlice(self):
     num = 5
@@ -807,12 +806,10 @@ class LaxControlFlowTest(jtu.JaxTestCase):
                   f"got {tree_util.tree_structure(2.)} and {tree_util.tree_structure((3., 3.))}.")):
       lax.cond(True, lambda top: 2., lambda fop: (3., 3.), 1.)
     with self.assertRaisesRegex(
-        TypeError, textwrap.dedent(
-            r"""
-            true_fun and false_fun output must have identical types, got
-            ShapedArray\(float32\[1\]\)
-            and
-            ShapedArray\(float32\[\].*\).""").strip()):
+        TypeError,
+        "true_fun and false_fun output must have identical types, got\n"
+        r"DIFFERENT ShapedArray\(float32\[1\]\) vs. "
+        r"ShapedArray\(float32\[\].*\)."):
       lax.cond(True,
                lambda top: jnp.array([1.], jnp.float32),
                lambda fop: jnp.float32(1.),
@@ -837,12 +834,10 @@ class LaxControlFlowTest(jtu.JaxTestCase):
                   f"got {tree_util.tree_structure(2.)} and {tree_util.tree_structure((3., 3.))}.")):
       lax.switch(1, [lambda _: 2., lambda _: (3., 3.)], 1.)
     with self.assertRaisesRegex(
-        TypeError, textwrap.dedent(
-            r"""
-            branch 0 and 1 outputs must have identical types, got
-            ShapedArray\(float32\[1\]\)
-            and
-            ShapedArray\(float32\[\].*\).""").strip()):
+        TypeError,
+        "branch 0 and 1 outputs must have identical types, got\n"
+        r"DIFFERENT ShapedArray\(float32\[1\]\) "
+        r"vs. ShapedArray\(float32\[\].*\)."):
       lax.switch(1, [lambda _: jnp.array([1.], jnp.float32),
                      lambda _: jnp.float32(1.)],
                  1.)
@@ -1458,7 +1453,12 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
     ans =                scan(f, c, as_)
     expected = scan_reference(f, c, as_)
-    self.assertAllClose(ans, expected, check_dtypes=False)
+    self.assertAllClose(
+        ans,
+        expected,
+        check_dtypes=False,
+        rtol={np.float64: 1.4e-15},
+        atol={np.float64: 8e-15})
 
   @parameterized.named_parameters(
       {"testcase_name": "_jit_scan={}_jit_f={}_impl={}".format(
@@ -1688,9 +1688,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     with self.assertRaisesWithLiteralMatch(
         TypeError,
         "scan carry output and input must have identical types, got\n"
-        "ShapedArray(int32[])\n"
-        "and\n"
-        "ShapedArray(float32[])."):
+        "DIFFERENT ShapedArray(int32[]) vs. ShapedArray(float32[])."):
       lax.scan(lambda c, x: (np.int32(0), x), np.float32(1.0), a)
     with self.assertRaisesRegex(TypeError,
         re.escape("scan carry output and input must have same type structure, "
@@ -1804,19 +1802,16 @@ class LaxControlFlowTest(jtu.JaxTestCase):
   def testIssue757(self):
     # code from https://github.com/google/jax/issues/757
     def fn(a):
-        return jnp.cos(a)
+      return jnp.cos(a)
 
     def loop(val):
-        iterations = 10
-        def apply_carry(x, i):
-            return jax.grad(fn, argnums=(0,))(x)[0], i
+      iterations = 10
 
-        final_val, _ = lax.scan(
-            apply_carry,
-            val,
-            jnp.arange(iterations)
-        )
-        return final_val
+      def apply_carry(x, i):
+        return jax.grad(fn, argnums=(0,))(x)[0], i
+
+      final_val, _ = lax.scan(apply_carry, val, jnp.arange(iterations))
+      return final_val
 
     arg = 0.5
     jax.jit(jax.jacfwd(loop, argnums=(0,)))(arg)  # doesn't crash
@@ -2052,8 +2047,8 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(results, inputs ** 1.5, check_dtypes=False)
 
     results = jax.jit(sqrt_cubed)(5.0)
-    self.assertAllClose(results, 5.0 ** 1.5, check_dtypes=False,
-                        rtol={np.float64:1e-7})
+    self.assertAllClose(
+        results, 5.0**1.5, check_dtypes=False, rtol={np.float64: 1e-7})
 
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_custom_root_vector_with_solve_closure(self):
@@ -2765,7 +2760,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     x = rng.randn(32, 2, 32).astype('float32')  # numpy.ndarray, not DeviceArray
     _, vjp_fun = jax.vjp(cumprod, x)
     *_, ext_res = vjp_fun.args[0].args[0]
-    self.assertIsInstance(ext_res, xla.DeviceArray)
+    self.assertIsInstance(ext_res, jnp.DeviceArray)
 
   def test_scan_vmap_collectives(self):
     def scan_f(state, x):

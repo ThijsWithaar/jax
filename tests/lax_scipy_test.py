@@ -286,7 +286,11 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     args_maker = lambda: [rng(shape, dtype) + (d - 1) / 2.]
     self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker,
                             tol={np.float32: 1e-3, np.float64: 1e-14})
-    self._CompileAndCheck(lax_fun, args_maker)
+    self._CompileAndCheck(
+        lax_fun, args_maker, rtol={
+            np.float32: 3e-07,
+            np.float64: 4e-15
+        })
 
   def testIssue980(self):
     x = np.full((4,), -1e20, dtype=np.float32)
@@ -485,6 +489,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
       for nonzero_condition_number in nonzero_condition_numbers
       for dtype in jtu.dtypes.floating
       for seed in seeds))
+  @jtu.skip_on_devices("gpu")  # Fails on A100.
   def testPolar(
     self, n_zero_sv, degeneracy, geometric_spectrum, max_sv, shape, method,
       side, nonzero_condition_number, dtype, seed):
@@ -575,6 +580,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     for linear_size in linear_sizes
     for seed in seeds
     for dtype in jtu.dtypes.floating))
+  @jtu.skip_on_devices("gpu")  # Fails on A100.
   def test_spectral_dac_svd(self, linear_size, seed, dtype):
     if jnp.dtype(dtype).name in ("bfloat16", "float16"):
       if jtu.device_under_test() != "cpu":

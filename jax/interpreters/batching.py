@@ -19,18 +19,17 @@ from typing import (Any, Callable, Dict, Set, Optional, Tuple, Union, Iterable,
 import numpy as np
 
 import jax
-from ..config import config
-from .. import core
-from ..core import raise_to_shaped, Trace, Tracer
+from jax.config import config
+from jax import core
+from jax.core import raise_to_shaped, Trace, Tracer
 from jax._src.tree_util import tree_unflatten, tree_flatten
 from jax._src.ad_util import (add_jaxvals, add_jaxvals_p, zeros_like_jaxval,
                               zeros_like_p, Zero)
-from .. import linear_util as lu
-from .._src.util import (unzip2, safe_map, safe_zip, wrap_name, split_list,
-                         canonicalize_axis, moveaxis, as_hashable_function,
-                         curry, memoize)
-from . import xla
-from . import partial_eval as pe
+from jax import linear_util as lu
+from jax._src.util import (unzip2, safe_map, safe_zip, wrap_name, split_list,
+                           canonicalize_axis, moveaxis, as_hashable_function,
+                           curry, memoize)
+from jax.interpreters import partial_eval as pe
 
 map = safe_map
 
@@ -421,8 +420,6 @@ def _batch_jaxpr_inner(axis_size, out_axes_dest, main, in_axes, *in_vals):
   if len(out_axes_dest) != len(out_axes):
     out_axis_dest, = out_axes_dest
     out_axes_dest = [out_axis_dest] * len(out_axes)
-  if len(out_axes) != len(out_axes_dest):
-    breakpoint()
   out_vals = map(partial(matchaxis, trace.axis_name, axis_size),
                  out_axes, out_axes_dest, out_vals)
   out_batched = [dst is not None for dst in out_axes_dest]
@@ -629,5 +626,3 @@ def zeros_like_batched(batched_args, batch_dims):
   bdim, = batch_dims
   return zeros_like_jaxval(val), bdim
 primitive_batchers[zeros_like_p] = zeros_like_batched
-
-defvectorized(xla.device_put_p)

@@ -19,8 +19,10 @@ from typing import (Tuple, List, Sequence, Set, Dict, Any, Callable, Union,
                     Optional)
 
 from jax import core
+from jax._src import dispatch
 from jax._src import source_info_util
 from jax.core import Var, Literal, Atom, Tracer
+from jax._src import util
 from jax._src.util import (safe_zip, safe_map, curry, unzip2, split_list,
                            tuple_delete)
 import jax._src.pretty_printer as pp
@@ -625,12 +627,12 @@ xla.xla_shape_handlers[AbsArray] = _array_xla_shape
 xla.canonicalize_dtype_handlers[Array] = identity
 
 def _array_device_put(x, device):
-  return xla._device_put_array(x._data, device)
-xla.device_put_handlers[Array] = _array_device_put
+  return dispatch._device_put_array(x._data, device)
+dispatch.device_put_handlers[Array] = _array_device_put
 
 def _bdint_device_put(x, device):
-  return xla._device_put_scalar(x._val, device)
-xla.device_put_handlers[BoundedInt] = _bdint_device_put
+  return dispatch._device_put_scalar(x._val, device)
+dispatch.device_put_handlers[BoundedInt] = _bdint_device_put
 
 def _bdint_canoncalize_dtype(x):
   return BoundedInt(xla.canonicalize_dtype(x._val), x._bound)
@@ -677,8 +679,8 @@ def djaxpr_subcomp(c, jaxpr, dim_args, args):
 
 def execute_compiled(compiled, partitioner, handlers, dim_vals, args):
   input_bufs = list(it.chain(
-      (buf for x in dim_vals for buf in xla.device_put(x, None)),
-      (buf for x in args     for buf in xla.device_put(x, None))))
+      (buf for x in dim_vals for buf in dispatch.device_put(x, None)),
+      (buf for x in args     for buf in dispatch.device_put(x, None))))
   out_bufs = compiled.execute(input_bufs)
   dims_dict, grouped_bufs = partitioner(out_bufs)
   return [handler(dims_dict, bs) for handler, bs in zip(handlers, grouped_bufs)]
@@ -705,7 +707,7 @@ def result_handler(aval):
   if isinstance(aval, AbsArray):
     return array_result_handler(aval)
   else:
-    handler = xla.aval_to_result_handler(None, aval)
+    handler = dispatch.aval_to_result_handler(None, aval)
     return lambda _, bufs: handler(*bufs)
 
 def array_result_handler(aval):
@@ -721,7 +723,7 @@ def array_result_handler(aval):
     else:
       raise NotImplementedError  # TODO
   padded_aval = core.ShapedArray(tuple(padded_shape), aval._eltTy._dtype)
-  array_handler = xla.array_result_handler(None, padded_aval)
+  array_handler = dispatch.array_result_handler(None, padded_aval)
   def handler(dims_dict, bufs):
     shape = tuple(dims_dict[d] if isinstance(d, Var) else
                   DimIndexer(dims_dict[d.name], d.indices) if isinstance(d, DimIndexingExpr) else
@@ -806,8 +808,8 @@ def traceable_to_padded_translation(traceable):
     platform = "cpu"  # TODO: don't hardwire in the CPU translation.
     ctx = xla.TranslationContext(c, platform, xla.AxisEnv(1, (), ()), '')
     outs = xla.jaxpr_subcomp(ctx, jaxpr, xla._xla_consts(c, consts), *operands_)
-    return xla._partition_outputs(
-      [aval_to_num_buffers(aval) for aval in out_avals], outs)
+    return util.unflatten(outs,
+                          [aval_to_num_buffers(aval) for aval in out_avals])
   return translation
 
 def _replace_vars_with_bounds(aval):
