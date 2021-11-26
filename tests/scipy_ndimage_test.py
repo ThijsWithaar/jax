@@ -80,36 +80,24 @@ class NdimageTest(jtu.JaxTestCase):
     self._CheckAgainstNumpy(osp_op, lsp_op, args_maker, tol=1e-6)
 
   def testAffineTransform_JVP(self):
-    Y, X = np.mgrid[:5, :7]
-    alpha = .2
-    x0 = 2; y0 = 1
-    G = 9 * np.exp(-alpha * ((X-x0)**2 + (Y-y0)**2)).astype(np.float32)
+    Y, X = np.mgrid[:5, :6]
+    alpha = .02
+    x0 = 3.; y0 = 2.
+    #G = 9 * np.exp(-alpha * ((X-x0)**2 + (Y-y0)**2)).astype(np.float32)
+    #import pdb; pdb.set_trace()
+    G = (1.3*np.power(np.abs(X - x0), 1.2) + 0.0*(Y-y0)).astype(np.float32)
     print("G = ", G.round(2))
 
     H = np.array([
-        [1.1, 0  , 0],
-        [0  , 1.0, 0],
-        [0  , 0  , 1]
+        [1.2, 0  , 0],
+        [0  , .75, 0],
+        [0  , 0  , 1.5]
     ], dtype=np.float32)
 
     def jvp_num(dH):
-        eps = 1e-6
+        eps = 1e-2
         dy = lsp_ndimage.affine_transform(G, H + eps*dH) - lsp_ndimage.affine_transform(G, H - eps*dH)
         return dy / (2*eps)
-
-    #y = lsp_ndimage.affine_transform(G, H)
-
-    dx = np.array([
-        [0,0,0],
-        [0,0,1],
-        [0,0,0]
-    ], dtype=np.float32)
-
-    dy = np.array([
-        [0,0,1],
-        [0,0,0],
-        [0,0,0]
-    ], dtype=np.float32)
 
     for m in range(2,3):
         for n in range(3):
@@ -117,12 +105,8 @@ class NdimageTest(jtu.JaxTestCase):
             dH[m,n] = 1
             _, df_dH = jvp(lsp_ndimage.affine_transform, (G, H), (0*G, dH))
             df_dH_num = jvp_num(dH)
-            print("\ndf/dH%i,%i =\n" % (m,n), df_dH.round(0))
-            print("df/dH%i,%i (num)=\n" % (m,n), df_dH_num.round(0))
 
-            # Derivatives at border don't match
-            #self.assertAllClose(df_dH[1:-1,1:-1], df_dH_num[1:-1,1:-1], atol=2)
-    assert(False)
+            self.assertAllClose(df_dH, df_dH_num, atol=2)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}_coordinates={}_order={}_mode={}_cval={}_impl={}_round={}".format(
