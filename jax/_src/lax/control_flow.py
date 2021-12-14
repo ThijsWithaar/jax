@@ -31,6 +31,7 @@ import numpy as np
 import jax
 from jax._src import api
 from jax import core
+from jax._src import ad_checkpoint
 from jax._src import dtypes
 from jax._src import source_info_util
 from jax._src import util
@@ -48,11 +49,10 @@ from jax.interpreters import batching
 from jax.interpreters import masking
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import mhlo
-from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client
 from jax._src.traceback_util import api_boundary
 from jax._src.util import (unzip2, unzip3, safe_map, safe_zip,
-                           split_list, cache, extend_name_stack)
+                           split_list, cache, extend_name_stack, wrap_name)
 from jax.tree_util import (tree_flatten, tree_unflatten, treedef_is_leaf,
                            treedef_children, treedef_tuple, tree_multimap,
                            tree_leaves, tree_structure)
@@ -342,7 +342,7 @@ def _while_loop_translation_rule(ctx, avals_in, avals_out, *args, cond_jaxpr,
   init_carry = xops.Tuple(c, cond_consts + body_consts + init_vals)
 
   cond_c = xla_client.XlaBuilder("cond_computation")
-  cond_carry = xb.parameter(cond_c, 0, c.get_shape(init_carry))
+  cond_carry = xla.parameter(cond_c, 0, c.get_shape(init_carry))
   cond_carry_elts = [xops.GetTupleElement(cond_carry, i) for i in range(len(args))]
   x, _, z = split_list(cond_carry_elts, [cond_nconsts, body_nconsts])
   cond_ctx = ctx.replace(builder=cond_c,
@@ -353,12 +353,13 @@ def _while_loop_translation_rule(ctx, avals_in, avals_out, *args, cond_jaxpr,
       *(x + z))
   if batched:
     scalar = ShapedArray((), np.bool_)
-    or_ = xla.primitive_subcomputation(ctx.platform, lax.or_p, scalar, scalar)
+    or_ = xla.primitive_subcomputation(ctx.platform, ctx.axis_env, lax.or_p,
+                                       scalar, scalar)
     pred = xops.Reduce(cond_c, [pred], [xops.Constant(cond_c, np.array(False))],
                        or_, list(range(cond_jaxpr.out_avals[0].ndim)))
 
   body_c = xla_client.XlaBuilder("body_computation")
-  body_carry = xb.parameter(body_c, 0, c.get_shape(init_carry))
+  body_carry = xla.parameter(body_c, 0, c.get_shape(init_carry))
   body_carry_elts = [xops.GetTupleElement(body_carry, i) for i in range(len(args))]
   x, y, z = split_list(body_carry_elts, [cond_nconsts, body_nconsts])
   body_ctx = ctx.replace(builder=body_c,
@@ -930,7 +931,7 @@ def _cond_translation_rule(ctx, avals_in, avals_out, index, *args, branches,
   name_stack = extend_name_stack(ctx.name_stack, "cond")
   def make_computation(name, jaxpr, op_shape):
     c = xla_client.XlaBuilder(name + '_comp')
-    op = xb.parameter(c, 0, op_shape)
+    op = xla.parameter(c, 0, op_shape)
     ops = [xops.GetTupleElement(op, i) for i in range(len(jaxpr.in_avals))]
     subctx = ctx.replace(
         builder=c, name_stack=extend_name_stack(name_stack, name + '_fun'))
@@ -1480,7 +1481,7 @@ def scan(f: Callable[[Carry, X], Tuple[Carry, Y]],
     return carry, stacked_y
 
   x_shapes = [masking.padded_shape_as_value(x.shape[1:]) for x in xs_flat]
-  x_dtypes = [x.dtype for x in xs_flat]
+  x_dtypes = [dtypes.canonicalize_dtype(x.dtype) for x in xs_flat]
   x_avals = tuple(_map(ShapedArray, x_shapes, x_dtypes))
 
   def _create_jaxpr(init):
@@ -2038,7 +2039,7 @@ def _masked_scan_jaxpr(jaxpr, num_consts, num_carry):
                  for new_c, c in zip(new_carry, carry)]
     return [i + 1] + new_carry + ys
 
-  aval = ShapedArray((), dtypes.int_)
+  aval = ShapedArray((), dtypes.canonicalize_dtype(dtypes.int_))
   const_avals, carry_avals, x_avals = split_list(jaxpr.in_avals, [num_consts, num_carry])
   return _make_closed_jaxpr(masked, [aval] + const_avals + [aval] + carry_avals + x_avals)
 
@@ -2924,3 +2925,93 @@ def _cumulative_jvp_rule(primals, tangents, *, axis: int, reverse: bool,
 ad.primitive_jvps[cumprod_p] = partial(_cumulative_jvp_rule, combine_fn=lax.mul)
 ad.primitive_jvps[cummin_p] = partial(_cumulative_jvp_rule, combine_fn=lax.min)
 ad.primitive_jvps[cummax_p] = partial(_cumulative_jvp_rule, combine_fn=lax.max)
+
+
+def _dummy_remat_result(aval: core.AbstractValue):
+  """A result that will be discarded"""
+  if aval is core.AbstractToken:
+    return lax.create_token()
+  elif aval is core.abstract_unit:
+    return core.unit
+  else:
+    return lax.broadcast(np.array(0, dtype=aval.dtype), aval.shape)  # type: ignore
+
+def _remat_translation_using_cond(*args,
+                                  jaxpr: core.Jaxpr):
+  # Implements:
+  #  if(rng(0, 1) < 2)
+  #    return eval_jaxpr(*args)
+  #  else:
+  #    return 0
+  avals_out = tuple(ov.aval for ov in jaxpr.outvars)
+
+  def remat_comp(*args):
+    return tuple(core.eval_jaxpr(jaxpr, (), *args))
+  def dummy_comp(*args):
+    return tuple(_map(_dummy_remat_result, avals_out))
+
+  cond_pred = (lax.rng_uniform(np.float32(0), np.float32(1), shape=()) < np.float32(2))
+  return cond(cond_pred, remat_comp, dummy_comp, *args)
+
+def _remat_translation_using_while(*args,
+                                   jaxpr: core.Jaxpr):
+  # Implements:
+  #  for(counter=0, result=0; counter < rng(1, 2); counter ++) {
+  #     result = eval_jaxpr(*args)
+  #  }
+  # The loop carry is a tuple: (counter, result, args)
+  avals_out = tuple(ov.aval for ov in jaxpr.outvars)
+  dummies_like_result = tuple(_map(_dummy_remat_result, avals_out))
+  carry_init = (np.int32(0), dummies_like_result, args)
+  def cond(carry):
+    counter, _, _ = carry
+    return counter < lax.rng_uniform(np.int32(1), np.int32(2), shape=())
+
+  def body(carry):
+    counter, _, args = carry
+    results = core.eval_jaxpr(jaxpr, (), *args)
+    return (counter + 1, tuple(results), args)
+
+  carry_res = while_loop(cond, body, carry_init)
+  return carry_res[1]
+
+def _remat_translation_rule(*args,
+                            call_jaxpr: Optional[core.Jaxpr] = None,
+                            jaxpr: Optional[core.Jaxpr] = None,
+                            platform: str,
+                            prevent_cse: bool, differentiated: bool,
+                            policy,
+                            concrete: bool = False,
+                            name: str = "checkpoint"):
+  # Support either "jaxpr" (for remat2) and "call_jaxpr" (for remat)
+  # name is not passed for remat2, defaults to "checkpoint"
+  # TODO: remove call_jaxpr once we drop the remat call primitive
+  if jaxpr is None:
+    jaxpr = call_jaxpr
+  assert jaxpr is not None
+  assert not jaxpr.constvars
+
+  del concrete, policy  # Unused.
+  if differentiated and prevent_cse:
+    if platform == "gpu":
+      translation_rule = _remat_translation_using_while
+    else:
+      translation_rule = _remat_translation_using_cond
+  else:
+    translation_rule = lambda *args, jaxpr: core.eval_jaxpr(jaxpr, (), *args)
+
+  return jax.named_call(translation_rule, name=wrap_name(name, "remat"))(*args, jaxpr=jaxpr)
+
+for platform in ("cpu", "gpu", "tpu"):
+  for remat_primitive in (pe.remat_call_p, ad_checkpoint.remat_p):  # type: ignore
+    if xla._USE_LAX_REMAT_LOWERING:
+      xla.register_translation(remat_primitive,
+                               xla.lower_fun(partial(_remat_translation_rule,
+                                                     platform=platform),
+                                             new_style=True, multiple_results=True,
+                                             backend=platform),
+                              platform=platform)
+    mlir.register_lowering(remat_primitive,
+                           mlir.lower_fun(partial(_remat_translation_rule,
+                                                   platform=platform),
+                                          multiple_results=True))

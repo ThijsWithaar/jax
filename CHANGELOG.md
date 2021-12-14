@@ -8,11 +8,28 @@ Remember to align the itemized text with the first line of an item within a list
 PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
 -->
 
-## jaxlib 0.1.75 (Unreleased)
-
-## jax 0.2.26 (Unreleased)
+## jax 0.2.27 (Unreleased)
 * [GitHub
-  commits](https://github.com/google/jax/compare/jax-v0.2.25...main).
+  commits](https://github.com/google/jax/compare/jax-v0.2.26...main).
+
+* Breaking changes:
+  * The host_callback primitives have been simplified to drop the
+  special autodiff handling for hcb.id_tap and id_print.
+  From now on, only the primals are tapped. The old behavior can be
+  obtained (for a limited time) by setting the ``JAX_HOST_CALLBACK_AD_TRANSFORMS``
+  environment variable, or the ```--flax_host_callback_ad_transforms``` flag.
+  Additionally, added documentation for how to implement the old behavior
+  using JAX custom AD APIs ({jax-issue}`#7839`).
+
+## jaxlib 0.1.76 (Unreleased)
+
+## jaxlib 0.1.75 (Dec 8, 2021)
+* New features:
+  * Support for python 3.10.
+
+## jax 0.2.26 (Dec 8, 2021)
+* [GitHub
+  commits](https://github.com/google/jax/compare/jax-v0.2.25...jax-v0.2.26).
 
 * Bug fixes:
   * Out-of-bounds indices to `jax.ops.segment_sum` will now be handled with

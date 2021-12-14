@@ -21,9 +21,13 @@ import jax.numpy as jnp
 from jax import core, jit, lax, make_jaxpr
 from jax._src import device_array
 from jax._src import dispatch
+from jax._src import dtypes
+from jax.interpreters import mlir
 from jax.interpreters import xla
+from jax._src.lib.mlir import ir
 from jax._src.lib import xla_bridge, xla_client
 xops = xla_client.ops
+xc = xla_client
 xb = xla_bridge
 
 from jax.config import config
@@ -63,13 +67,15 @@ class AbstractSparseArray(core.ShapedArray):
 
   def __init__(self, shape, dtype, index_dtype, nnz, weak_type=False,
                named_shape=None):
-    super().__init__(shape, dtype)
+    super().__init__(shape, dtypes.canonicalize_dtype(dtype))
     named_shape = {} if named_shape is None else named_shape
     self.index_dtype = index_dtype
     self.nnz = nnz
-    self.data_aval = core.ShapedArray((nnz,), dtype, weak_type, named_shape)
-    self.indices_aval = core.ShapedArray((nnz, len(shape)), index_dtype,
-                                         named_shape=named_shape)
+    self.data_aval = core.ShapedArray((nnz,), dtypes.canonicalize_dtype(dtype),
+                                      weak_type, named_shape)
+    self.indices_aval = core.ShapedArray(
+        (nnz, len(shape)), dtypes.canonicalize_dtype(index_dtype),
+        named_shape=named_shape)
 
   def update(self, shape=None, dtype=None, index_dtype=None, nnz=None,
              weak_type=None, named_shape=None):
@@ -111,14 +117,14 @@ def sparse_array_result_handler(device, aval):
 
 def sparse_array_shape_handler(a):
   return (
-    xla.xc.Shape.array_shape(a.data_aval.dtype, a.data_aval.shape),
-    xla.xc.Shape.array_shape(a.indices_aval.dtype, a.indices_aval.shape),
+    xc.Shape.array_shape(a.data_aval.dtype, a.data_aval.shape),
+    xc.Shape.array_shape(a.indices_aval.dtype, a.indices_aval.shape),
   )
 
 def sparse_array_device_put_handler(a, device):
   return (
-    xla.xb.get_device_backend(device).buffer_from_pyval(a.data, device),
-    xla.xb.get_device_backend(device).buffer_from_pyval(a.indices, device)
+    xb.get_device_backend(device).buffer_from_pyval(a.data, device),
+    xb.get_device_backend(device).buffer_from_pyval(a.indices, device)
   )
 
 def sparse_array_constant_handler(c, val, canonicalize_dtypes):
@@ -132,10 +138,20 @@ core.raise_to_shaped_mappings[AbstractSparseArray] = lambda aval, _: aval
 xla.pytype_aval_mappings[SparseArray] = lambda x: x.aval
 xla.canonicalize_dtype_handlers[SparseArray] = lambda x: x
 dispatch.device_put_handlers[SparseArray] = sparse_array_device_put_handler
-dispatch.xla_result_handlers[AbstractSparseArray] = sparse_array_result_handler
+dispatch.result_handlers[AbstractSparseArray] = sparse_array_result_handler
+dispatch.num_buffers_handlers[AbstractSparseArray] = lambda _: 2
 xla.xla_shape_handlers[AbstractSparseArray] = sparse_array_shape_handler
 xla.register_constant_handler(SparseArray, sparse_array_constant_handler)
 
+def sparse_array_mlir_type_handler(a):
+  return (
+    ir.RankedTensorType.get(
+          a.data_aval.shape, mlir.dtype_to_ir_type(a.data_aval.dtype)),
+    ir.RankedTensorType.get(
+          a.indices_aval.shape, mlir.dtype_to_ir_type(a.indices_aval.dtype)),
+  )
+
+mlir.ir_type_handlers[AbstractSparseArray] = sparse_array_mlir_type_handler
 
 sp_indices_p = core.Primitive('sp_indices')
 
@@ -154,6 +170,11 @@ def _sp_indices_translation_rule(ctx, avals_in, avals_out, data, indices):
 # because it leads to infinite recursion.
 xla.register_translation(sp_indices_p, _sp_indices_translation_rule)
 
+def _sp_indices_mhlo_lowering(ctx, avals_in, avals_out, data_and_indices):
+  return [data_and_indices[1]]
+
+mlir.register_lowering(sp_indices_p, _sp_indices_mhlo_lowering)
+
 sp_data_p = core.Primitive('sp_data')
 
 @sp_data_p.def_impl
@@ -171,6 +192,11 @@ def _sp_data_translation_rule(ctx, avals_in, avals_out, data, indices):
 # because it leads to infinite recursion.
 xla.register_translation(sp_data_p, _sp_data_translation_rule)
 
+def _sp_data_mhlo_lowering(ctx, avals_in, avals_out, data_and_indices):
+  return [data_and_indices[0]]
+
+mlir.register_lowering(sp_data_p, _sp_data_mhlo_lowering)
+
 def identity(x):
   return identity_p.bind(x)
 
@@ -187,6 +213,10 @@ def _identity_abstract_eval(mat):
 xla.register_translation(
     identity_p, xla.lower_fun(_identity_impl, multiple_results=False,
                               new_style=True))
+
+
+mlir.register_lowering(
+    identity_p, mlir.lower_fun(_identity_impl, multiple_results=False))
 
 def split(x):
   return split_p.bind(x)
@@ -260,7 +290,8 @@ core.raise_to_shaped_mappings[AbstractEmpty] = lambda aval, _: aval
 xla.pytype_aval_mappings[Empty] = lambda x: AbstractEmpty()
 xla.canonicalize_dtype_handlers[Empty] = lambda x: x
 dispatch.device_put_handlers[Empty] = lambda _, __: ()
-dispatch.xla_result_handlers[AbstractEmpty] = lambda _, __: lambda: Empty(AbstractEmpty())
+dispatch.result_handlers[AbstractEmpty] = lambda _, __: lambda: Empty(AbstractEmpty())
+dispatch.num_buffers_handlers[AbstractEmpty] = lambda _: 0
 xla.xla_shape_handlers[AbstractEmpty] = lambda _: ()
 
 

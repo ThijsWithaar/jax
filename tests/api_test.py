@@ -45,6 +45,7 @@ from jax._src import api, dtypes
 from jax.core import Primitive
 from jax.errors import UnexpectedTracerError
 from jax.interpreters import ad
+from jax.interpreters import mlir
 from jax.interpreters import xla
 from jax.interpreters import pxla
 from jax.interpreters.sharded_jit import PartitionSpec as P
@@ -253,7 +254,7 @@ class CPPJitTest(jtu.BufferDonationTestCase):
       self.assertLen(w, 1)
       self.assertTrue(issubclass(w[-1].category, UserWarning))
       self.assertIn(
-          "Some donated buffers were not usable: f32[2]{0}, s32[2]{0}",
+          "Some donated buffers were not usable:",
           str(w[-1].message))
 
   @jtu.skip_on_devices("cpu")  # In/out aliasing not supported on CPU.
@@ -371,7 +372,7 @@ class CPPJitTest(jtu.BufferDonationTestCase):
     def f(x):
       return x + x - 3.
 
-    xs = [np.random.randn(i) for i in range(10)]
+    xs = [self.rng().randn(i) for i in range(10)]
     with concurrent.futures.ThreadPoolExecutor() as executor:
       futures = [executor.submit(partial(f, x)) for x in xs]
       ys = [f.result() for f in futures]
@@ -413,7 +414,7 @@ class CPPJitTest(jtu.BufferDonationTestCase):
   def test_jit_on_all_devices(self):
     # Verifies we can run the same computation on every device present, even
     # if they are, for example, different models of GPU.
-    data = np.random.rand(1000).astype(np.float32)
+    data = self.rng().rand(1000).astype(np.float32)
     f = self.jit(jnp.negative)
     for device in jax.local_devices():
       x = device_put(data, device=device)
@@ -783,6 +784,30 @@ class CPPJitTest(jtu.BufferDonationTestCase):
     f_com = f_low.compile()
     f_low.donate_argnums == f_com.donate_argnums == (0,)
 
+  def test_jit_lower_compile_vmap(self):
+    f = self.jit(lambda x: x + 4).lower(1.).compile()
+    def err():
+      return jax.vmap(lambda x: f(x) + 2)(jnp.ones(3))
+    self.assertRaisesRegex(
+        TypeError,
+        "Cannot apply JAX transformations to a function lowered and compiled "
+        "for a particular signature. Detected .*BatchTracer",
+        err)
+
+  @unittest.skipIf(jax._src.lib._xla_extension_version < 45,
+                   "requires jaxlib >= 0.1.75")
+  def test_jit_enum_as_dict_keys_fails(self):
+    class E(enum.Enum):
+      A = 0
+      B = 1
+
+    @self.jit
+    def f(d) -> float:
+      return d[E.A]
+
+    with self.assertRaisesRegex(TypeError, "'<' not supported.*"):
+      f({E.A: 1.0, E.B: 2.0})
+
 
 class PythonJitTest(CPPJitTest):
 
@@ -984,8 +1009,8 @@ class APITest(jtu.JaxTestCase):
 
     foo_p.def_abstract_eval(lambda x: x)
 
-    jtu.check_raises(lambda: jit(foo)(1.0), NotImplementedError,
-                     "XLA translation rule for primitive 'foo' not found")
+    jtu.check_raises_regexp(lambda: jit(foo)(1.0), NotImplementedError,
+                     ".* rule for primitive 'foo' not found.*")
 
     foo_p.def_impl(lambda x: x)
     ad.defjvp(foo_p, lambda g, x: foo(g))
@@ -1052,7 +1077,7 @@ class APITest(jtu.JaxTestCase):
     if len(api.local_devices()) < 2:
       raise unittest.SkipTest("this test requires multiple devices")
     d1, d2 = api.local_devices()[:2]
-    data = np.random.randn(*shape).astype(np.float32)
+    data = self.rng().randn(*shape).astype(np.float32)
     x = api.device_put(data, device=d1)
     self.assertEqual(x.device_buffer.device(), d1)
     y = api.device_put(x, device=d2)
@@ -1078,7 +1103,7 @@ class APITest(jtu.JaxTestCase):
 
   @jtu.skip_on_devices("tpu")
   def test_jacobian(self):
-    R = np.random.RandomState(0).randn
+    R = self.rng().randn
     A = R(4, 3)
     x = R(3)
 
@@ -1091,7 +1116,7 @@ class APITest(jtu.JaxTestCase):
 
   @jtu.skip_on_devices("tpu")
   def test_hessian(self):
-    R = np.random.RandomState(0).randn
+    R = self.rng().randn
     A = R(4, 4)
     x = R(4)
 
@@ -1135,7 +1160,7 @@ class APITest(jtu.JaxTestCase):
                   (0., 1., 0.))
       self.assertAllClose(ans, expected, check_dtypes=False)
 
-      R = np.random.RandomState(0).randn
+      R = self.rng().randn
       x = R(2)
       y = R(3)
       ans = jacfun(lambda x, y: {'x': x, 'xy': jnp.outer(x, y)})(x, y)
@@ -1918,6 +1943,17 @@ class APITest(jtu.JaxTestCase):
     self.assertEqual(param_shapes[0].xla_element_type(),
                      xla_client.PrimitiveType.TUPLE)
 
+  def test_compiler_ir(self):
+    # TODO(phawkins): merge these tests with the `xla_computation` tests.
+    def e(x):
+      return jnp.sin(jnp.cos(x))
+    hlo = api.jit(e).lower(2.).compiler_ir(dialect="hlo").as_hlo_text()
+    self.assertIn(' cosine', hlo)
+    self.assertIn(' sine', hlo)
+    mhlo = api.jit(e).lower(2.).compiler_ir(dialect="mhlo")
+    self.assertIn('mhlo.cosine', mhlo)
+    self.assertIn('mhlo.sine', mhlo)
+
   def test_staging_out_multi_replica(self):
     def f(x):
       return api.pmap(jnp.mean)(x)
@@ -2018,7 +2054,7 @@ class APITest(jtu.JaxTestCase):
         x = jax.device_get(y)
       return x
 
-    xs = [np.random.randn(i) for i in range(10)]
+    xs = [self.rng().randn(i) for i in range(10)]
     with concurrent.futures.ThreadPoolExecutor() as executor:
       futures = [executor.submit(partial(f, x)) for x in xs]
       ys = [f.result() for f in futures]
@@ -2145,8 +2181,8 @@ class APITest(jtu.JaxTestCase):
     def h(a, b):
       return jnp.sum(a) + jnp.sum(b)
 
-    X = np.random.randn(10, 4)
-    U = np.random.randn(10, 2)
+    X = self.rng().randn(10, 4)
+    U = self.rng().randn(10, 2)
 
     with self.assertRaisesRegex(
         ValueError,
@@ -2328,6 +2364,26 @@ class APITest(jtu.JaxTestCase):
         "positional arguments.",
         lambda: partial(df, x=0.)(y=1.))
 
+  def test_jit_compilation_time_logging(self):
+    @api.jit
+    def f(x):
+      return x * 2
+
+    # make sure some initial warnings & cached operations already happen.
+    f(jnp.ones(2))
+
+    prev_level = logging.get_verbosity()
+    try:
+      logging.set_verbosity('DEBUG')
+      with self.assertLogs(level=logging.DEBUG) as l:
+        f(2.)
+    finally:
+      logging.set_verbosity(prev_level)
+    self.assertLen(l.output, 3)  # 3 lines
+    self.assertIn('Finished tracing', l.output[0])
+    self.assertIn('Compiling f', l.output[1])
+    self.assertIn('Finished XLA compilation', l.output[2])
+
   def test_grad_of_jit_compilation_caching(self):
     if not hasattr(self, "assertLogs"):
       raise unittest.SkipTest("test requires assertLogs (python 3)")
@@ -2347,7 +2403,7 @@ class APITest(jtu.JaxTestCase):
         ans2 = api.grad(f)(3.)
     finally:
       logging.set_verbosity(prev_level)
-    self.assertLen(l.output, 2)  # one for fwd, one for bwd
+    self.assertLen(l.output, 2 * 3)  # one for fwd, one for bwd, 3 lines each
     self.assertAllClose(ans1, np.cos(2.), check_dtypes=False)
     self.assertAllClose(ans2, np.cos(3.), check_dtypes=False)
 
@@ -2406,18 +2462,24 @@ class APITest(jtu.JaxTestCase):
     def g(x):
       return f(2, x)
 
-    jaxpr_subcomp = xla.jaxpr_subcomp
+    xla_jaxpr_subcomp = xla.jaxpr_subcomp
+    mlir_jaxpr_subcomp = mlir.jaxpr_subcomp
 
     jaxprs = []
-    def jaxpr_subcomp_and_collect(c, jaxpr, *args, **kwargs):
+    def xla_jaxpr_subcomp_and_collect(c, jaxpr, *args, **kwargs):
       jaxprs.append(jaxpr)
-      return jaxpr_subcomp(c, jaxpr, *args, **kwargs)
+      return xla_jaxpr_subcomp(c, jaxpr, *args, **kwargs)
+    def mlir_jaxpr_subcomp_and_collect(c, jaxpr, *args, **kwargs):
+      jaxprs.append(jaxpr)
+      return mlir_jaxpr_subcomp(c, jaxpr, *args, **kwargs)
 
     try:
-      xla.jaxpr_subcomp = jaxpr_subcomp_and_collect
+      xla.jaxpr_subcomp = xla_jaxpr_subcomp_and_collect
+      mlir.jaxpr_subcomp = mlir_jaxpr_subcomp_and_collect
       ans = g(3)
     finally:
-      xla.jaxpr_subcomp = jaxpr_subcomp
+      xla.jaxpr_subcomp = xla_jaxpr_subcomp
+      mlir.jaxpr_subcomp = mlir_jaxpr_subcomp
 
     self.assertEqual(ans, (7, 3))
     self.assertLen(jaxprs, 2)
@@ -2708,7 +2770,8 @@ class APITest(jtu.JaxTestCase):
 
     @jit
     def f():
-      core.lattice_join(core.ConcreteArray(x), core.ConcreteArray(y))
+      core.lattice_join(core.ConcreteArray(x.dtype, x),
+                        core.ConcreteArray(y.dtype, y))
 
     f()  # doesn't crash
 
@@ -3099,9 +3162,9 @@ class APITest(jtu.JaxTestCase):
 
     # A large and potentially unaligned array to trigger non-zero-copy and
     # async device array copy.
-    xs = np.random.uniform(0., 1., size=(10, 131, 111, 3)).astype(np.float32)
+    xs = self.rng().uniform(0., 1., size=(10, 131, 111, 3)).astype(np.float32)
     for x in xs:
-      delta = np.random.uniform(-0.5, 0.5, size=())
+      delta = self.rng().uniform(-0.5, 0.5, size=())
       jitted_f = api.jit(f)
       np.testing.assert_allclose(jitted_f(x, delta), f(x, delta))
 
@@ -5048,7 +5111,7 @@ class CustomJVPTest(jtu.JaxTestCase):
       tangent_out = supp * x_dot - (jnp.dot(supp, x_dot) / card) * supp
       return primal_out, tangent_out
 
-    rng = np.random.RandomState(0)
+    rng = self.rng()
     x = rng.rand(5).astype(np.float32)
 
     J_rev = jax.jacrev(projection_unit_simplex)(x)
@@ -5066,7 +5129,7 @@ class CustomJVPTest(jtu.JaxTestCase):
     def fun(X):
       return jnp.sum(proj(X) ** 2)
 
-    rng = np.random.RandomState(0)
+    rng = self.rng()
     X = rng.rand(4, 5).astype(np.float32)
     U = rng.rand(4, 5)
     U /= np.sqrt(np.sum(U ** 2))

@@ -69,7 +69,7 @@ from jax._src.lib.xla_bridge import (device_count, local_device_count, devices,
                                      local_devices, process_index,
                                      process_count, host_id, host_ids,
                                      host_count, default_backend)
-from jax.core import ConcreteArray, ShapedArray, raise_to_shaped
+from jax.core import ShapedArray, raise_to_shaped
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 from jax.interpreters import pxla
@@ -514,15 +514,22 @@ class Lowered:
     self.donate_argnums = donate_argnums
     self._no_kwargs = no_kwargs
 
-  def _xla_computation(self):
-    # TODO(frostig): finalize API. For now, return the underlying
-    # computation directly via this method.
-    return self._lowering.hlo()
-
   def compile(self) -> 'Compiled':
     return Compiled(
         self._lowering.compile(), self.in_tree, self.out_tree,
         self.donate_argnums, self._no_kwargs)
+
+  def compiler_ir(self, dialect: Optional[str] = None):
+    if dialect == "mhlo":
+      return self._lowering.mhlo()
+    elif dialect == "hlo" or dialect is None:
+      return self._lowering.hlo()
+    else:
+      raise ValueError(f"Unknown dialect {dialect}")
+
+  # TODO(frostig): remove this in favor of `compiler_ir`
+  def _xla_computation(self):
+    return self._lowering.hlo()
 
 
 class Compiled:
@@ -552,6 +559,19 @@ class Compiled:
     self.donate_argnums = donate_argnums
     self._no_kwargs = no_kwargs
 
+  def compiler_ir(self):
+    """Post-compilation IR.
+
+    Compilation typically involves code transformation and
+    optimization. This method exists to reflect the compiler's
+    representation of the program after such passes, whenever
+    possible.
+    """
+    return self._executable.xla_executable().hlo_modules()
+
+  def runtime_executable(self):
+    return self._executable.xla_executable()
+
   def _xla_executable(self):
     # TODO(frostig): finalize API. For now, return the underlying
     # executable directly via this method.
@@ -572,7 +592,25 @@ class Compiled:
       # and transformation
       raise TypeError(
           f'function compiled for {self.in_tree}, called with {in_tree}')
-    out_flat = self._executable.call(*args_flat)
+    try:
+      out_flat = self._executable.call(*args_flat)
+    except TypeError as e:
+      # We can't transform ahead-of-time compiled calls, since we've
+      # lowered and compiled for a fixed function signature, and JAX
+      # transformations change signatures. We interpret a Tracer
+      # argument as an indication of a transformation attempt. We
+      # could check this before the executable call, but we'd rather
+      # avoid isinstance checks on the call path. Seeing a TypeError
+      # might mean that arguments have JAX-invalid types, which in
+      # turn might mean some are Tracers.
+      for arg in args_flat:
+        if isinstance(arg, core.Tracer):
+          raise TypeError(
+              'Cannot apply JAX transformations to a function lowered and '
+              'compiled for a particular signature. Detected argument of '
+              f'Tracer type {type(arg)}.')
+      else:
+        raise
     return tree_unflatten(self.out_tree, out_flat)
 
 
@@ -860,7 +898,7 @@ def xla_computation(fun: Callable,
       out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
     build_out_tuple = partial(xc.ops.Tuple, c, out_nodes)
     if out_parts is not None:
-      out_tuple = xb.with_sharding(c, out_parts_flat, build_out_tuple)
+      out_tuple = xla.with_sharding(c, out_parts_flat, build_out_tuple)
     else:
       out_tuple = build_out_tuple()
 
@@ -2769,6 +2807,8 @@ def _device_get(x):
 
 def device_get(x: Any):
   """Transfer ``x`` to host.
+
+  If ``x`` is a pytree, then the individual buffers are copied in parallel.
 
   Args:
     x: An array, scalar, DeviceArray or (nested) standard Python container thereof

@@ -19,6 +19,7 @@ from typing import Any, List, NamedTuple, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from jax import core
+from jax._src import dtypes
 from jax._src.lax import lax
 from jax.interpreters import ad
 from jax.interpreters import batching
@@ -143,8 +144,9 @@ def conv_general_dilated(
     padding = lax.padtype_to_pads(
         np.take(lhs.shape, lhs_perm)[2:], effective_rhs_shape,  # type: ignore[index]
         window_strides, padding)
-  preferred_element_type = (None if preferred_element_type is None else
-                            np.dtype(preferred_element_type))
+  preferred_element_type = (
+      None if preferred_element_type is None else
+      dtypes.canonicalize_dtype(np.dtype(preferred_element_type)))
   return conv_general_dilated_p.bind(
       lhs, rhs, window_strides=tuple(window_strides), padding=tuple(padding),
       lhs_dilation=tuple(lhs_dilation), rhs_dilation=tuple(rhs_dilation),
@@ -319,7 +321,7 @@ def conv_transpose(lhs: Array, rhs: Array, strides: Sequence[int],
   k_sdims = k_shape[2:]  # type: ignore[index]
   # Calculate correct output shape given padding and strides.
   pads: Union[str, Sequence[Tuple[int, int]]]
-  if padding in {'SAME', 'VALID'}:
+  if isinstance(padding, str) and padding in {'SAME', 'VALID'}:
     if rhs_dilation is None:
       rhs_dilation = (1,) * (rhs.ndim - 2)
     effective_k_size = map(lambda k, r: (k-1) * r + 1, k_sdims, rhs_dilation)
@@ -717,16 +719,23 @@ def _complex_mul(mul, x, y):
   k3 = mul(x_im, lax.add(y_re, y_im))
   return lax.complex(lax.sub(k1, k3), lax.add(k1, k2))
 
+
+_real_dtype = lambda dtype: np.finfo(dtype).dtype
+
 def _conv_general_dilated_lower(
     ctx, avals_in, avals_out, lhs, rhs, *, window_strides, padding,
     lhs_dilation, rhs_dilation, dimension_numbers, feature_group_count,
-    batch_group_count, precision, expand_complex_convolutions=False,
-    **unused_kwargs):
+    batch_group_count, precision, preferred_element_type,
+    expand_complex_convolutions=False, **unused_kwargs):
   lhs_aval, rhs_aval = avals_in
   aval_out, = avals_out
   assert isinstance(dimension_numbers, ConvDimensionNumbers)
   dtype = lhs_aval.dtype
   if expand_complex_convolutions and np.issubdtype(dtype, np.complexfloating):
+    if preferred_element_type is not None:
+      # Convert complex dtype to types used for real and imaginary parts
+      assert np.issubdtype(preferred_element_type, np.complexfloating)
+      preferred_element_type = _real_dtype(preferred_element_type)
     complex_conv = mlir.lower_fun(
       partial(
         _complex_mul,
@@ -734,7 +743,8 @@ def _conv_general_dilated_lower(
                 padding=padding, lhs_dilation=lhs_dilation,
                 rhs_dilation=rhs_dilation, dimension_numbers=dimension_numbers,
                 feature_group_count=feature_group_count,
-                batch_group_count=batch_group_count, precision=precision)),
+                batch_group_count=batch_group_count, precision=precision,
+                preferred_element_type=preferred_element_type)),
       multiple_results=False)
     return complex_conv(ctx, avals_in, avals_out, lhs, rhs)
 
@@ -751,16 +761,15 @@ def _conv_general_dilated_lower(
     output_spatial_dimensions=list(out_spec[2:]))
   num_spatial_dims = len(rhs_spec) - 2
   window_reversal = mlir.dense_bool_elements([False] * num_spatial_dims)
-
-  return mhlo.ConvOp(mlir.aval_to_ir_type(aval_out), lhs, rhs,
-                     mlir.dense_int_elements(window_strides),
-                     mlir.dense_int_elements(padding),
-                     mlir.dense_int_elements(lhs_dilation),
-                     mlir.dense_int_elements(rhs_dilation),
-                     window_reversal,
-                     dnums, mlir.i64_attr(feature_group_count),
-                     mlir.i64_attr(batch_group_count),
-                     lax.precision_attr(precision)).results
+  return [mhlo.ConvOp(mlir.aval_to_ir_type(aval_out), lhs, rhs,
+                      mlir.dense_int_elements(window_strides),
+                      mlir.dense_int_elements(padding),
+                      mlir.dense_int_elements(lhs_dilation),
+                      mlir.dense_int_elements(rhs_dilation),
+                      window_reversal, dnums,
+                      mlir.i64_attr(feature_group_count),
+                      mlir.i64_attr(batch_group_count),
+                      lax.precision_attr(precision)).result]
 
 mlir.register_lowering(conv_general_dilated_p, _conv_general_dilated_lower)
 mlir.register_lowering(

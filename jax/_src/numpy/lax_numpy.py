@@ -451,6 +451,14 @@ array_repr = np.array_repr
 save = np.save
 savez = np.savez
 
+@_wraps(np.dtype)
+def _jnp_dtype(obj, align=False, copy=False):
+  """Similar to np.dtype, but respects JAX dtype defaults."""
+  if obj is None:
+    obj = dtypes.float_
+  elif isinstance(obj, type) and obj in dtypes.python_scalar_dtypes:
+    obj = _DEFAULT_TYPEMAP[np.dtype(obj, align=align, copy=copy).type]
+  return np.dtype(obj, align=align, copy=copy)
 
 ### utility functions
 
@@ -479,7 +487,7 @@ def _np_array(obj, dtype=None, **kwargs):
   arr_dtype = np.dtype(arr.dtype).type
   if dtype is None and obj_dtype is None:
     if dtypes.is_python_scalar(obj):
-      arr = arr.astype(dtypes.dtype(obj))
+      arr = arr.astype(result_type(obj))
     elif arr_dtype in _DEFAULT_TYPEMAP:
       arr = arr.astype(_DEFAULT_TYPEMAP[arr_dtype])
   return arr
@@ -2204,7 +2212,7 @@ def bincount(x, weights=None, minlength=0, *, length=None):
     length = core.concrete_or_error(operator.index, length,
         "The error occurred because of argument 'length' of jnp.bincount.")
   if weights is None:
-    weights = 1
+    weights = np.array(1, dtype=int_)
   elif shape(x) != shape(weights):
     raise ValueError("shape of weights must match shape of x.")
   return zeros(length, _dtype(weights)).at[clip(x, 0)].add(weights)
@@ -2855,7 +2863,7 @@ def nonzero(a, *, size=None, fill_value=None):
   if a.size == 0 or size == 0:
     return tuple(zeros(size, int) for dim in a.shape)
   flat_indices = cumsum(bincount(cumsum(mask), length=size))
-  strides = np.cumprod(a.shape[::-1])[::-1] // a.shape
+  strides = (np.cumprod(a.shape[::-1])[::-1] // a.shape).astype(int_)
   out = tuple((flat_indices // stride) % size for stride, size in zip(strides, a.shape))
   if size is not None and fill_value is not None:
     if not isinstance(fill_value, tuple):
@@ -3049,7 +3057,7 @@ def _check_no_padding(axis_padding, mode):
 def _pad_constant(array, pad_width, constant_values):
   nd = ndim(array)
   constant_values = broadcast_to(asarray(constant_values), (nd, 2))
-  constant_values = lax.convert_element_type(constant_values, array.dtype)
+  constant_values = lax._convert_element_type(constant_values, array.dtype, dtypes.is_weakly_typed(array))
   for i in range(nd):
     widths = [(0, 0, 0)] * nd
     widths[i] = (pad_width[i, 0], 0, 0)
@@ -3160,6 +3168,7 @@ def _pad_linear_ramp(array, pad_width, end_values):
         dtype=array.dtype,
         axis=axis
     )
+    ramp_before = lax._convert_element_type(ramp_before, weak_type=dtypes.is_weakly_typed(array))
     ramp_after = linspace(
         start=end_values[axis][1],
         stop=edge_after.squeeze(axis), # Dimension is replaced by linspace
@@ -3168,6 +3177,7 @@ def _pad_linear_ramp(array, pad_width, end_values):
         dtype=array.dtype,
         axis=axis
     )
+    ramp_after = lax._convert_element_type(ramp_after, weak_type=dtypes.is_weakly_typed(array))
 
     # Reverse linear space in appropriate dimension
     ramp_after = flip(ramp_after, axis)
@@ -3201,8 +3211,8 @@ def _pad_stats(array, pad_width, stat_length, stat_func):
       stat_before = round(stat_before)
       stat_after = round(stat_after)
 
-    stat_before = stat_before.astype(array.dtype)
-    stat_after = stat_after.astype(array.dtype)
+    stat_before = lax._convert_element_type(stat_before, array.dtype, dtypes.is_weakly_typed(array))
+    stat_after = lax._convert_element_type(stat_after, array.dtype, dtypes.is_weakly_typed(array))
 
     npad_before, npad_after = pad_width[i]
     pad_before = repeat(stat_before, npad_before, axis=i)
@@ -3216,10 +3226,10 @@ def _pad_empty(array, pad_width):
   # Note: jax.numpy.empty = jax.numpy.zeros
   for i in range(ndim(array)):
     shape_before = array.shape[:i] + (pad_width[i][0],) + array.shape[i + 1:]
-    pad_before = empty(shape_before, dtype=array.dtype)
+    pad_before = empty_like(array, shape=shape_before)
 
     shape_after = array.shape[:i] + (pad_width[i][1],) + array.shape[i + 1:]
-    pad_after = empty(shape_after, dtype=array.dtype)
+    pad_after = empty_like(array, shape=shape_after)
     array = lax.concatenate([pad_before, array, pad_after], dimension=i)
   return array
 
@@ -3681,7 +3691,7 @@ def full_like(a, fill_value, dtype=None, shape=None):
     return lax.full_like(a, fill_value, dtype, shape)
   else:
     shape = np.shape(a) if shape is None else shape
-    dtype = _dtype(a) if dtype is None else dtype
+    dtype = result_type(a) if dtype is None else dtype
     return broadcast_to(asarray(fill_value, dtype=dtype), shape)
 
 
@@ -3690,18 +3700,16 @@ def zeros(shape, dtype=None):
   if isinstance(shape, types.GeneratorType):
     raise TypeError("expected sequence object with len >= 0 or a single integer")
   lax._check_user_dtype_supported(dtype, "zeros")
-  dtype = float_ if dtype is None else dtype
-  shape = (shape,) if ndim(shape) == 0 else shape
-  return lax.full(shape, 0, dtype)
+  shape = canonicalize_shape((shape,) if ndim(shape) == 0 else shape)
+  return lax.full(shape, 0, _jnp_dtype(dtype))
 
 @_wraps(np.ones)
 def ones(shape, dtype=None):
   if isinstance(shape, types.GeneratorType):
     raise TypeError("expected sequence object with len >= 0 or a single integer")
   lax._check_user_dtype_supported(dtype, "ones")
-  dtype = float_ if dtype is None else dtype
-  shape = (shape,) if ndim(shape) == 0 else shape
-  return lax.full(shape, 1, dtype)
+  shape = canonicalize_shape((shape,) if ndim(shape) == 0 else shape)
+  return lax.full(shape, 1, _jnp_dtype(dtype))
 
 
 @_wraps(np.array_equal)
@@ -3740,13 +3748,12 @@ empty = zeros
 @_wraps(np.eye)
 def eye(N, M=None, k=0, dtype=None):
   lax._check_user_dtype_supported(dtype, "eye")
-  dtype = float_ if dtype is None else dtype
   N = core.canonicalize_dim(N, "'N' argument of jnp.eye()")
   M = N if M is None else core.canonicalize_dim(M, "'M' argument of jnp.eye()")
   if N < 0 or M < 0:
     raise ValueError(f"negative dimensions are not allowed, got {N} and {M}")
   k = operator.index(k)
-  return lax._eye(dtype, (N, M), k)
+  return lax._eye(_jnp_dtype(dtype), (N, M), k)
 
 
 @_wraps(np.identity)
@@ -3767,7 +3774,9 @@ def arange(start: core.DimSize, stop: Optional[core.DimSize]=None,
           "jax.numpy.arange supports non-constant arguments only in single-argument form. "
           f"Found jax.numpy.arange(start={start}, stop={stop}, step={step})")
     return lax.iota(int_, start)
-  dtype = dtype or result_type(start, *(x for x in [stop, step] if x is not None))
+  if dtype is None:
+    dtype = result_type(start, *(x for x in [stop, step] if x is not None))
+  dtype = _jnp_dtype(dtype)
   if stop is None and step is None:
     start = require(start, msg("stop"))
     start = np.ceil(start).astype(int)
@@ -3811,7 +3820,9 @@ def _linspace(start, stop, num=50, endpoint=True, retstep=False, dtype=None,
     raise ValueError(f"Number of samples, {num}, must be non-negative.")
   _check_arraylike("linspace", start, stop)
 
-  dtype = dtype or result_type(start, stop, dtypes.canonicalize_dtype(float_))
+  if dtype is None:
+    dtype = result_type(start, stop, dtypes.canonicalize_dtype(float_))
+  dtype = _jnp_dtype(dtype)
   computation_dtype = promote_types(dtype, dtypes.canonicalize_dtype(float_))
   start = asarray(start, dtype=computation_dtype)
   stop = asarray(stop, dtype=computation_dtype)
@@ -3868,7 +3879,9 @@ def _logspace(start, stop, num=50, endpoint=True, base=10.0, dtype=None,
              axis: int = 0):
   """Implementation of logspace differentiable in start and stop args."""
   lax._check_user_dtype_supported(dtype, "logspace")
-  dtype = dtype or result_type(start, stop, dtypes.canonicalize_dtype(float_))
+  if dtype is None:
+    dtype = result_type(start, stop, dtypes.canonicalize_dtype(float_))
+  dtype = _jnp_dtype(dtype)
   computation_dtype = promote_types(dtype, dtypes.canonicalize_dtype(float_))
   _check_arraylike("logspace", start, stop)
   start = asarray(start, dtype=computation_dtype)
@@ -3889,7 +3902,9 @@ def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis: int = 0):
 def _geomspace(start, stop, num=50, endpoint=True, dtype=None, axis: int = 0):
   """Implementation of geomspace differentiable in start and stop args."""
   lax._check_user_dtype_supported(dtype, "geomspace")
-  dtype = dtype or result_type(start, stop, dtypes.canonicalize_dtype(float_))
+  if dtype is None:
+    dtype = result_type(start, stop, dtypes.canonicalize_dtype(float_))
+  dtype = _jnp_dtype(dtype)
   computation_dtype = promote_types(dtype, dtypes.canonicalize_dtype(float_))
   _check_arraylike("geomspace", start, stop)
   start = asarray(start, dtype=computation_dtype)
@@ -5301,9 +5316,10 @@ def lexsort(keys, axis=-1):
   if len({shape(key) for key in keys}) > 1:
     raise ValueError("all keys need to be the same shape")
   if ndim(keys[0]) == 0:
-    return np.int64(0)
+    return array(0, dtype=dtypes.canonicalize_dtype(int_))
   axis = _canonicalize_axis(axis, ndim(keys[0]))
-  iota = lax.broadcasted_iota(np.int64, shape(keys[0]), axis)
+  use_64bit_index = keys[0].shape[axis] >= (1 << 31)
+  iota = lax.broadcasted_iota(int64 if use_64bit_index else int_, shape(keys[0]), axis)
   return lax.sort((*keys[::-1], iota), dimension=axis, num_keys=len(keys))[-1]
 
 
@@ -5326,7 +5342,8 @@ def argsort(a, axis: Optional[int] = -1, kind='stable', order=None):
     return argsort(a.ravel(), 0)
   else:
     axis_num = _canonicalize_axis(axis, ndim(a))
-    iota = lax.broadcasted_iota(np.int64, shape(a), axis_num)
+    use_64bit_index = a.shape[axis_num] >= (1 << 31)
+    iota = lax.broadcasted_iota(int64 if use_64bit_index else int_, shape(a), axis_num)
     _, perm = lax.sort_key_val(a, iota, dimension=axis_num)
     return perm
 
@@ -5601,14 +5618,21 @@ def _unique(ar, axis, return_index=False, return_inverse=False, return_counts=Fa
   """
   Find the unique elements of an array along a particular axis.
   """
+  if ar.shape[axis] == 0 and size and fill_value is None:
+    raise ValueError(
+      "jnp.unique: for zero-sized input with nonzero size argument, fill_value must be specified")
+
   aux, mask, perm = _unique_sorted_mask(ar, axis)
   ind = mask if size is None else nonzero(mask, size=size)[0]
   result = aux[ind] if aux.size else aux
   if fill_value is not None:
     fill_value = asarray(fill_value, dtype=result.dtype)
   if size is not None and fill_value is not None:
-    valid = lax.expand_dims(arange(size) < mask.sum(), tuple(range(1, result.ndim)))
-    result = where(valid, result, fill_value)
+    if result.shape[0]:
+      valid = lax.expand_dims(arange(size) < mask.sum(), tuple(range(1, result.ndim)))
+      result = where(valid, result, fill_value)
+    else:
+      result = full_like(result, fill_value, shape=(size, *result.shape[1:]))
   result = moveaxis(result, 0, axis)
 
   ret = (result,)
@@ -5634,7 +5658,7 @@ def _unique(ar, axis, return_index=False, return_inverse=False, return_counts=Fa
         idx = idx.at[1:].set(where(idx[1:], idx[1:], mask.size))
       ret += (diff(idx),)
     elif ar.shape[axis]:
-      ret += (array([ar.shape[axis]]),)
+      ret += (array([ar.shape[axis]], dtype=int_),)
     else:
       ret += (empty(0, dtype=int),)
   if return_true_size:
@@ -6547,6 +6571,8 @@ def nanmedian(a, axis: Optional[Union[int, Tuple[int, ...]]] = None, out=None,
 
 
 def _astype(arr, dtype):
+  if dtype is None:
+    dtype = dtypes.canonicalize_dtype(float_)
   lax._check_user_dtype_supported(dtype, "astype")
   return lax.convert_element_type(arr, dtype)
 

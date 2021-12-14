@@ -25,6 +25,7 @@ from jax.experimental.global_device_array import GlobalDeviceArray as GDA
 from jax import core
 from jax import linear_util as lu
 from jax._src.api import _check_callable, _check_arg, Lowered
+from jax._src import dispatch
 from jax._src import source_info_util
 from jax._src.api_util import (argnums_partial_except, flatten_axes,
                                flatten_fun_nokwargs, _ensure_index_tuple,
@@ -32,12 +33,12 @@ from jax._src.api_util import (argnums_partial_except, flatten_axes,
                                shaped_abstractify)
 from jax.errors import JAXTypeError
 from jax.interpreters import ad
+from jax.interpreters import mlir
 from jax.interpreters import pxla
 from jax.interpreters import xla
 from jax.interpreters import batching
 from jax.interpreters import partial_eval as pe
 from jax.interpreters.sharded_jit import PartitionSpec
-from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
 from jax.tree_util import tree_map, tree_flatten, tree_unflatten, tree_leaves
 from jax._src.util import (extend_name_stack, HashableFunction, safe_zip,
@@ -48,6 +49,13 @@ xops = xc._xla.ops
 class _FromGsdaSingleton:
   pass
 FROM_GDA = _FromGsdaSingleton()
+
+def _is_from_gda(x):
+  # It's occasionally possible to end up with two FROM_GDA singletons (e.g. if
+  # pickling in_axis_resources and sending to other processes). Make sure this
+  # doesn't cause an error to avoid user confusion.
+  return isinstance(x, type(FROM_GDA))
+
 
 # TODO(yashkatariya): Add pjit microbenchmarks.
 def pjit(fun: Callable,
@@ -95,9 +103,14 @@ def pjit(fun: Callable,
     of ``pjit`` every process only "sees" its local piece of the input and output,
     corresponding to its local sub-mesh.
 
-    The SPMD model requires that the same multi-process ``pjit``'d functions must
-    be run in the same order on all processes, but they can be interspersed with
-    arbitrary operations running in a single process.
+    This means that each process's participating local devices must form a
+    _contiguous_ local sub-mesh within the full global mesh. A contiguous
+    sub-mesh is one where all of its devices are adjacent within the global
+    mesh, and form a rectangular prism.
+
+    The SPMD model also requires that the same multi-process ``pjit``'d
+    functions must be run in the same order on all processes, but they can be
+    interspersed with arbitrary operations running in a single process.
 
   Args:
     fun: Function to be compiled. Should be a pure function, as side-effects may
@@ -286,7 +299,7 @@ def flatten_axis_resources(what, tree, axis_resources, tupled_args):
 def _pjit_jaxpr(fun, mesh, local_in_avals,
                 in_tree, in_axis_resources_thunk,
                 out_tree, out_axis_resources_thunk,
-                in_positional_semantics, out_positional_semantics, is_gsda):
+                in_positional_semantics, out_positional_semantics, is_gda):
   # TODO(yashkatariya): Make this work with FROM_GDA special value.
   in_axis_resources_flat = flatten_axis_resources(
         "pjit in_axis_resources", in_tree,
@@ -295,16 +308,26 @@ def _pjit_jaxpr(fun, mesh, local_in_avals,
   # `FROM_GDA` is passed to any input other than GDA, a ugly error message
   # will be raised because get_array_mapping (in local_to_global) of a
   # FROM_GDA cannot happen.
-  tree_map(_check_resources_mismatch, in_axis_resources_flat, is_gsda)
-  _check_shapes_against_resources("pjit arguments", False, mesh.local_mesh.shape,
-                                  local_in_avals, in_axis_resources_flat)
+  tree_map(_check_resources_mismatch, in_axis_resources_flat, is_gda)
+  # If all inputs are GDAs, then the avals are global and the mesh should also
+  # be global. This split is because non-contiguous mesh can only be used if all
+  # inputs are GDAs.
+  if all(is_gda):
+    _check_shapes_against_resources(
+        "pjit arguments", mesh.is_multi_process, mesh.shape, local_in_avals,
+        in_axis_resources_flat)
+  else:
+    _check_shapes_against_resources("pjit arguments", False, mesh.local_mesh.shape,
+                                    local_in_avals, in_axis_resources_flat)
   global_in_avals = local_to_global(in_positional_semantics, mesh,
                                     local_in_avals, in_axis_resources_flat)
 
   prev_positional = maps._positional_semantics
   try:
     maps._positional_semantics = maps._PositionalSemantics.GLOBAL
-    jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_dynamic(fun, global_in_avals)
+    with dispatch.log_elapsed_time(f"Finished tracing + transforming {fun.__name__} "
+                                   "for pjit in {elapsed_time} sec"):
+      jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_dynamic(fun, global_in_avals)
   finally:
     maps._positional_semantics = prev_positional
   jaxpr = core.ClosedJaxpr(jaxpr, consts)
@@ -377,8 +400,30 @@ class ParsedPartitionSpec:
 
   def __eq__(self, other):
     return (self.partitions == other.partitions and
-            self.unsafe_user_spec == other.unsafe_user_spec and
             self.sync == other.sync)
+
+  def eq_given_rank(self, other, rank):
+    """Determines whether the specs are equivalent when considering arrays of a given rank.
+
+    ParsedPartitionSpecs may contain trailing empty tuples, that make them
+    semantically different in general, and yet in some situations we prefer
+    to regard them as equivalent. For example, partitions of () and ((),)
+    cannot be always considered equivalent, since the first one is a valid
+    spec for a scalar value, while the second is not! However, when either of
+    those are applied to a 2D array, they both mean that the array is fully
+    replicated.
+
+    Because of those subtle differences, we use __eq__ to decide semantic
+    equality in general, while this method determines whether the two specs
+    are equivalent when applied to an array of a given rank. Note that this
+    relation has larger equivalence classes than __eq__ (i.e. x == y implies
+    x.eq_given_rank(y, rank)).
+    """
+    assert len(self.partitions) <= rank and len(other.partitions) <= rank
+    min_length = min(len(self.partitions), len(other.partitions))
+    return (self.partitions[:min_length] == other.partitions[:min_length] and
+            all(p == () for p in self.partitions[min_length:]) and
+            all(p == () for p in other.partitions[min_length:]))
 
   def __len__(self):
     return len(self.partitions)
@@ -390,8 +435,9 @@ class ParsedPartitionSpec:
     return iter(self.partitions)
 
   def __repr__(self):
-    return f"<partitions={self.partitions} sync={self.sync}>"
-
+    return (f"ParsedPartitionSpec(partitions={self.partitions}, "
+            f"unsafe_user_spec={self.unsafe_user_spec}, "
+            f"sync={self.sync})")
 
 REPLICATED = ParsedPartitionSpec(None, ())
 
@@ -402,21 +448,21 @@ def _prepare_axis_resources(axis_resources, arg_name):
   entries, treedef = tree_flatten(axis_resources, is_leaf=lambda x: x is None)
   what = f"{arg_name} leaf specifications"
   entries = [
-      entry if entry is FROM_GDA else ParsedPartitionSpec.from_user_input(
+      entry if _is_from_gda(entry) else ParsedPartitionSpec.from_user_input(
           entry, what) for entry in entries
   ]
   _check_unique_resources(entries, arg_name)
   return tree_unflatten(treedef, entries), entries, treedef
 
-def _check_resources_mismatch(in_axis_resources_flat, is_gsda):
-  if not is_gsda and in_axis_resources_flat is FROM_GDA:
+def _check_resources_mismatch(in_axis_resources_flat, is_gda):
+  if not is_gda and _is_from_gda(in_axis_resources_flat):
     raise ValueError('For a non-GDA input, the corresponding resource in '
                      'in_axis_resources cannot be `pjit.FROM_GDA`.')
 
 def _check_unique_resources(axis_resources, arg_name):
   for arg_axis_resources in axis_resources:
     if not arg_axis_resources: continue
-    if arg_axis_resources is FROM_GDA: continue
+    if _is_from_gda(arg_axis_resources): continue
     resource_counts = Counter(it.chain.from_iterable(arg_axis_resources))
     if not resource_counts: continue
     if resource_counts.most_common(1)[0][1] > 1:
@@ -429,7 +475,7 @@ def _check_unique_resources(axis_resources, arg_name):
 def _check_shapes_against_resources(what: str, is_global_shape: bool, mesh_shape, flat_avals, flat_axis_resources):
   global_str = " global" if is_global_shape else ""
   for aval, aval_axis_resources in zip(flat_avals, flat_axis_resources):
-    if aval_axis_resources is FROM_GDA:
+    if _is_from_gda(aval_axis_resources):
       continue
     shape = aval.shape
     if len(shape) < len(aval_axis_resources):
@@ -484,16 +530,12 @@ def _pjit_lower(
   f = core.jaxpr_as_fun(jaxpr)
   f.__name__ = name
   fun = lu.wrap_init(f)
-  # TODO(yashkatariya): Passing in out_positional_semantics is a hack.
-  # This logic should get replaced with `is_global` attribute exists on aval.
-  local_in_avals = global_to_local(out_positional_semantics, resource_env.physical_mesh,
-                                   jaxpr.in_avals, in_axis_resources)
-  # TODO(yashkatariya): Passing positional_semantics is a hack. This should go
-  # away when avals have is_global attribute.
+  in_is_gda = [True if ips == maps._PositionalSemantics.GLOBAL else False
+               for ips in in_positional_semantics]
   return pxla.lower_mesh_computation(
       fun, name, resource_env.physical_mesh,
       in_axes, out_axes, donated_invars,
-      True, local_in_avals, tile_by_mesh_axes=False)
+      True, jaxpr.in_avals, tile_by_mesh_axes=False, in_is_gda=in_is_gda)
 
 
 def _pjit_abstract_eval(*args, jaxpr, out_axis_resources, resource_env,
@@ -503,7 +545,7 @@ def _pjit_abstract_eval(*args, jaxpr, out_axis_resources, resource_env,
 pjit_p.def_abstract_eval(_pjit_abstract_eval)
 
 
-def _pjit_translation_rule(c, axis_env, in_nodes, name_stack, backend, name,
+def _pjit_translation_rule(ctx, avals_in, avals_out, *in_nodes, name,
                            jaxpr, in_axis_resources, out_axis_resources,
                            resource_env, donated_invars, in_positional_semantics,
                            out_positional_semantics):
@@ -511,28 +553,32 @@ def _pjit_translation_rule(c, axis_env, in_nodes, name_stack, backend, name,
   subc = xc.XlaBuilder(f"pjit_{name}")
 
   args = []
-  for i, (n, axis_resources) in enumerate(safe_zip(in_nodes, in_axis_resources)):
+  for i, (n, aval, axis_resources) in enumerate(
+      safe_zip(in_nodes, avals_in, in_axis_resources)):
     # N.B. inlined calls shouldn't have shardings set directly on the inputs or
     # outputs (set_sharding_proto adds an identity operation).
-    arg = xb.parameter(subc, i, c.GetShape(n))
-    args.append(xb.set_sharding_proto(subc, arg,
-                                      get_sharding_proto(c, n, axis_resources, mesh)))
+    arg = xla.parameter(subc, i, ctx.builder.GetShape(n))
+    args.append(
+        xla.set_sharding_proto(
+            subc, arg, get_aval_sharding_proto(aval, axis_resources, mesh)))
 
   # TODO: Think about how to avoid duplicating constants with the outer jaxpr
-  ctx = xla.TranslationContext(
-      subc, backend, axis_env,
-      extend_name_stack(name_stack, wrap_name(name, "pjit")))
+  sub_ctx = ctx.replace(
+      builder=subc,
+      name_stack=extend_name_stack(ctx.name_stack, wrap_name(name, "pjit")))
   out_nodes = xla.jaxpr_subcomp(
-      ctx, jaxpr.jaxpr, xla._xla_consts(subc, jaxpr.consts), *args)
+      sub_ctx, jaxpr.jaxpr, xla._xla_consts(subc, jaxpr.consts), *args)
   out_nodes = [
-      xb.set_sharding_proto(subc, out,
-                            get_sharding_proto(subc, out, axis_resources, mesh))
-      for out, axis_resources in safe_zip(out_nodes, out_axis_resources)
+      xla.set_sharding_proto(subc, out,
+                             get_aval_sharding_proto(aval, axis_resources, mesh))
+      for out, aval, axis_resources in safe_zip(
+          out_nodes, avals_out, out_axis_resources)
   ]
 
   subc = subc.build(xops.Tuple(subc, out_nodes))
-  return xops.Call(c, subc, list(in_nodes))
-xla.call_translations[pjit_p] = _pjit_translation_rule
+  return xla.xla_destructure(ctx.builder,
+                             xops.Call(ctx.builder, subc, list(in_nodes)))
+xla.register_translation(pjit_p, _pjit_translation_rule)
 
 
 def _pjit_batcher(insert_axis,
@@ -814,11 +860,21 @@ ad.deflinear2(sharding_constraint_p,
 
 def _sharding_constraint_translation_rule(ctx, avals_in, avals_out, x_node, *,
                                           axis_resources, resource_env):
+  aval, = avals_in
   mesh = resource_env.physical_mesh
-  return [xb.set_sharding_proto(
-      ctx.builder, x_node,
-      get_sharding_proto(ctx.builder, x_node, axis_resources, mesh))]
+  return [xla.set_sharding_proto(
+      ctx.builder, x_node, get_aval_sharding_proto(aval, axis_resources, mesh))]
 xla.register_translation(sharding_constraint_p, _sharding_constraint_translation_rule)
+
+def _sharding_constraint_mhlo_lowering(ctx, avals_in, avals_out, x_node, *,
+                                       axis_resources, resource_env):
+  aval, = avals_in
+  mesh = resource_env.physical_mesh
+  return [mlir.wrap_with_sharding_op(
+      x_node, get_aval_sharding_proto(aval, axis_resources, mesh))]
+mlir.register_lowering(sharding_constraint_p,
+                       _sharding_constraint_mhlo_lowering)
+
 
 def _sharding_constraint_batcher(insert_axis, axis_size, axis_name, main_type, vals_in, dims_in,
                                  axis_resources, resource_env):
@@ -848,16 +904,6 @@ def get_array_mapping(axis_resources: ParsedPartitionSpec) -> pxla.ArrayMapping:
                      for i, axes in enumerate(axis_resources)
                      for axis in axes)
 
-def get_sharding_proto(c, xla_op, axis_resources: ParsedPartitionSpec,
-                       mesh: maps.Mesh) -> xc.OpSharding:
-  xla_shape = c.GetShape(xla_op)
-  if xla_shape.is_token():
-    aval = core.abstract_token
-    assert axis_resources is REPLICATED
-  else:
-    aval = core.ShapedArray(xla_shape.dimensions(), xla_shape.element_type())  # type: ignore
-  return get_aval_sharding_proto(aval, axis_resources, mesh)
-
 
 def get_aval_sharding_proto(aval: core.AbstractValue,
                             axis_resources: ParsedPartitionSpec,
@@ -886,12 +932,14 @@ def local_to_global(positional_semantics, mesh, avals, axes):
 def _canonicalize_spec(in_axis_resources_flat: ParsedPartitionSpec, arg):
   if isinstance(arg, GDA):
     gsda_ppspec = gsda_mesh_axes_to_parsed_pspec(arg._mesh_axes)
-    if in_axis_resources_flat is not FROM_GDA and in_axis_resources_flat != gsda_ppspec:
+    if (not _is_from_gda(in_axis_resources_flat) and
+        not in_axis_resources_flat.eq_given_rank(gsda_ppspec, len(arg.shape))):
       raise ValueError(
           'Got an input GDA to pjit with different partitioning than specified in '
-          'the in_axis_resources argument to pjit. The paritioning must match, or '
+          "the in_axis_resources argument to pjit. The partitioning must match, or "
           "use `jax.experimental.pjit.FROM_GDA` in `in_axis_resources`. "
-          f'Got GDA spec: {gsda_ppspec}, pjit spec: {in_axis_resources_flat}')
+          f"Got GDA spec: {gsda_ppspec.user_spec} and "
+          f"pjit spec: {in_axis_resources_flat.user_spec} for GDA: {arg}")
     return gsda_ppspec
   return in_axis_resources_flat
 

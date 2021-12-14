@@ -14,10 +14,13 @@
 
 # Primitive dispatch and jit dispatch.
 
+import contextlib
 from functools import partial
 import itertools
+import time
 from typing import (
     Any, Callable, Dict, Optional, Sequence, Set, Tuple, Type, Union)
+from typing_extensions import Protocol
 import warnings
 
 from absl import logging
@@ -28,6 +31,7 @@ from jax import linear_util as lu
 import jax.interpreters.ad as ad
 import jax.interpreters.batching as batching
 import jax.interpreters.masking as masking
+import jax.interpreters.mlir as mlir
 import jax.interpreters.xla as xla
 import jax.interpreters.partial_eval as pe
 from jax.errors import UnexpectedTracerError
@@ -35,6 +39,8 @@ from jax._src.abstract_arrays import array_types
 from jax._src.config import config
 from jax._src import device_array
 from jax._src import dtypes
+from jax._src import profiler
+from jax._src.lib.mlir import ir
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
 import jax._src.util as util
@@ -42,6 +48,7 @@ from jax._src import traceback_util
 
 traceback_util.register_exclusion(__file__)
 
+MYPY = False  # Are we currently type checking with mypy?
 
 xe = xc._xla
 
@@ -71,9 +78,6 @@ def arg_spec(x: Any) -> ArgSpec:
 
 def apply_primitive(prim, *args, **params):
   """Impl rule that compiles and runs a single primitive 'prim' using XLA."""
-  if config.jax_enable_mlir:
-    import jax.interpreters.mlir
-    return jax.interpreters.mlir.apply_primitive(prim, *args, **params)
   compiled_fun = xla_primitive_callable(prim, *unsafe_map(arg_spec, args),
                                         **params)
   return compiled_fun(*args)
@@ -123,12 +127,6 @@ def _device_from_arg_devices(devices: Sequence[Optional[Device]]) -> Optional[De
 
 def _xla_call_impl(fun: lu.WrappedFun, *args, device, backend, name,
                    donated_invars, inline):
-  if config.jax_enable_mlir:
-    import jax.interpreters.mlir
-    return jax.interpreters.mlir._xla_call_impl_mlir(
-        fun, *args, device=device, backend=backend, name=name,
-        donated_invars=donated_invars, inline=inline)
-
   del inline  # Only used at tracing time
   compiled_fun = _xla_callable(fun, device, backend, name, donated_invars,
                                *unsafe_map(arg_spec, args))
@@ -163,6 +161,19 @@ def _xla_callable_uncached(fun: lu.WrappedFun, device, backend, name,
 _xla_callable = lu.cache(_xla_callable_uncached)
 
 
+@contextlib.contextmanager
+def log_elapsed_time(fmt: str):
+  if _on_exit:
+    yield
+  else:
+    log_priority = logging.WARNING if config.jax_log_compiles else logging.DEBUG
+    start_time = time.time()
+    yield
+    elapsed_time = time.time() - start_time
+    logging.log(log_priority, fmt.format(elapsed_time=elapsed_time))
+
+
+@profiler.annotate_function
 def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
                        donated_invars, *arg_specs):
   if device is not None and backend is not None:
@@ -170,8 +181,10 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
                      "got device={} and backend={}".format(device, backend))
 
   abstract_args, arg_devices = util.unzip2(arg_specs)
-  jaxpr, out_avals, consts = pe.trace_to_jaxpr_final(
-      fun, abstract_args, pe.debug_info_final(fun, "jit"))
+  with log_elapsed_time(f"Finished tracing + transforming {fun.__name__} "
+                        "for jit in {elapsed_time} sec"):
+    jaxpr, out_avals, consts = pe.trace_to_jaxpr_final(
+        fun, abstract_args, pe.debug_info_final(fun, "jit"))
   if any(isinstance(c, core.Tracer) for c in consts):
     raise UnexpectedTracerError("Encountered an unexpected tracer.")
   jaxpr, kept_const_idx, kept_var_idx = _prune_unused_inputs(jaxpr)
@@ -193,13 +206,16 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   # and don't need to evaluate their arguments.
   if not jaxpr.eqns:
     return XlaComputation(
-        name, None, True, None, jaxpr, consts, device, abstract_args, out_avals,
-        kept_var_idx)
+        name, None, True, None, jaxpr=jaxpr, consts=consts, device=device,
+        in_avals=abstract_args, out_avals=out_avals, kept_var_idx=kept_var_idx)
 
   if not _on_exit:
     log_priority = logging.WARNING if config.jax_log_compiles else logging.DEBUG
-    logging.log(log_priority, "Compiling %s (%s) for args %s.",
-                fun.__name__, id(fun), abstract_args)
+    if len(abstract_args) > 10:
+      msg = f"Compiling {fun.__name__} ({id(fun)}) for {len(abstract_args)} args."
+    else:
+      msg = f"Compiling {fun.__name__} ({id(fun)} for args {abstract_args}."
+    logging.log(log_priority, msg)
 
   if nreps > 1:
     warnings.warn(
@@ -220,32 +236,26 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
         "jit of multi-host pmap not implemented (and jit-of-pmap can cause "
         "extra data movement anyway, so maybe you don't want it after all).")
 
-  tuple_args = len(abstract_args) > 100  # pass long arg lists as tuple for TPU
-
-  c = xc.XlaBuilder(f"jit_{fun.__name__}")
-  xla_consts = xla._xla_consts(c, consts)
-  xla_args, donated_invars = xla._xla_callable_args(c, abstract_args, tuple_args,
-                                                donated_invars=donated_invars)
-  platform = backend.platform
-  ctx = xla.TranslationContext(c, platform, xla.AxisEnv(nreps, (), ()),
-                               xla.extend_name_stack(xla.wrap_name(name, 'jit')))
-  out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
-  # There is a non-zero cost to building an output tuple, particularly on TPU.
-  # Avoid it if the output arity is 1.
-  output = out_nodes[0] if len(out_nodes) == 1 else xc.ops.Tuple(c, out_nodes)
-  if platform in ("gpu", "tpu"):
-    donated_invars = xla.set_up_aliases(
-        c, xla_args, c.GetShape(output), donated_invars, tuple_args)
-  if any(donated_invars):
-    # TODO(tomhennigan): At call time we should mark these buffers as deleted.
-    unused_donations = [str(c.GetShape(a))
-                        for a, d in zip(xla_args, donated_invars) if d]
-    warnings.warn("Some donated buffers were not usable: {}".format(
-        ", ".join(unused_donations)))
-  built = c.build(output)
+  # pass long arg lists as tuple for TPU
+  tuple_args = len(abstract_args) > 100
+  axis_env = xla.AxisEnv(nreps, (), ())
+  name_stack = xla.extend_name_stack(xla.wrap_name(name, 'jit'))
+  closed_jaxpr = core.ClosedJaxpr(jaxpr, consts)
+  module: Union[str, xc.XlaComputation]
+  module_name = f"jit_{fun.__name__}"
+  if config.jax_enable_mlir:
+    module = mlir.lower_jaxpr_to_module(
+        module_name, closed_jaxpr, backend.platform, axis_env, name_stack,
+        donated_invars)
+  else:
+    module = xla.lower_jaxpr_to_xla_module(
+        module_name, closed_jaxpr, backend.platform, axis_env,
+        name_stack, tuple_args, donated_invars, replicated_args=None,
+        arg_partitions=None, out_partitions=None)
   return XlaComputation(
-      name, built, False, donated_invars, nreps, device, backend, tuple_args,
-      abstract_args, out_avals, kept_var_idx)
+      name, module, False, donated_invars, nreps=nreps, device=device,
+      backend=backend, tuple_args=tuple_args, in_avals=abstract_args,
+      out_avals=out_avals, kept_var_idx=kept_var_idx)
 
 
 def prefetch(x):
@@ -369,27 +379,58 @@ def _xla_callable_device(nreps, backend, device, arg_devices):
       assert False  # Unreachable given the error check in _xla_callable
 
 
-# Result handlers
+# Argument and result handlers
 
-def aval_to_result_handler(device: Optional[Device],
-                           aval: core.AbstractValue) -> Callable:
+num_buffers_handlers: Dict[Type[core.AbstractValue],
+                           Callable[[core.AbstractValue], int]] = {}
+
+def aval_to_num_buffers(aval: core.AbstractValue) -> int:
+  """Returns the number of buffers in the runtime representation of `aval`.
+
+  In general this may differ from the number of buffers in the compiler-IR
+  representation of the same value.
+  """
   try:
-    return xla_result_handlers[type(aval)](device, aval)
+    return num_buffers_handlers[type(aval)](aval)
   except KeyError as err:
-    raise TypeError(f"No xla_result_handler for type: {type(aval)}") from err
+    raise TypeError(f"No num_buffers handler for type: {type(aval)}") from err
 
-def array_result_handler(device: Optional[Device], aval: core.ShapedArray):
+# TODO(phawkins): use zero buffers to represent a unit.
+num_buffers_handlers[core.AbstractUnit] = lambda _: 1
+num_buffers_handlers[core.AbstractToken] = lambda _: 1
+num_buffers_handlers[core.ShapedArray] = lambda _: 1
+num_buffers_handlers[core.ConcreteArray] = lambda _: 1
+
+
+if MYPY:
+  ResultHandler = Any
+else:
+  class ResultHandler(Protocol):
+    def __call__(self, *args: xla.Buffer) -> Any:
+      """Boxes raw buffers into their user-facing representation."""
+
+def aval_to_result_handler(sticky_device: Optional[Device],
+                           aval: core.AbstractValue) -> ResultHandler:
+  try:
+    return result_handlers[type(aval)](sticky_device, aval)
+  except KeyError as err:
+    raise TypeError(f"No result handler for type: {type(aval)}") from err
+
+def array_result_handler(sticky_device: Optional[Device],
+                          aval: core.ShapedArray):
   if aval.dtype is dtypes.float0:
     return lambda _: np.zeros(aval.shape, dtypes.float0)
-  return partial(device_array.make_device_array, core.raise_to_shaped(aval), device)
+  return partial(device_array.make_device_array, core.raise_to_shaped(aval),
+                 sticky_device)
 
 
-xla_result_handlers: Dict[Type[core.AbstractValue], Callable[..., Callable]] = {
-    core.AbstractUnit: lambda _, __: lambda _: core.unit,
-    core.ShapedArray: array_result_handler,
-    core.ConcreteArray: array_result_handler,
-}
-xla_result_handlers[core.AbstractToken] = lambda _, __: lambda _: core.token
+result_handlers: Dict[
+    Type[core.AbstractValue],
+    Callable[[Optional[Device], Any], ResultHandler]] = {}
+result_handlers[core.AbstractUnit] = lambda _, __: lambda _: core.unit
+result_handlers[core.AbstractToken] = lambda _, __: lambda _: core.token
+result_handlers[core.ShapedArray] = array_result_handler
+result_handlers[core.ConcreteArray] = array_result_handler
 
 
 def needs_check_special():
@@ -410,32 +451,26 @@ def _check_special(name, xla_shape, buf):
 
 
 def _execute_compiled(name: str, compiled: XlaExecutable,
-                      output_buffer_counts: Optional[Sequence[int]], handlers,
-                      kept_var_idx, *args):
+                      output_buffer_counts: Optional[Sequence[int]],
+                      result_handlers, kept_var_idx, *args):
   device, = compiled.local_devices()
-  input_bufs = list(
-      itertools.chain.from_iterable(
-          device_put(x, device)
-          for i, x in enumerate(args)
-          if x is not core.token and i in kept_var_idx))
+  input_bufs = util.flatten(
+      device_put(x, device) for i, x in enumerate(args) if i in kept_var_idx)
   out_bufs = compiled.execute(input_bufs)
   check_special(name, out_bufs)
   if output_buffer_counts is None:
-    return (handlers[0](*out_bufs),)
+    return (result_handlers[0](*out_bufs),)
   return tuple(
       handler(*bs) for handler, bs in
-      unsafe_zip(handlers, util.unflatten(out_bufs, output_buffer_counts)))
+      unsafe_zip(result_handlers, util.unflatten(out_bufs, output_buffer_counts)))
 
 
 def _execute_replicated(name: str, compiled: XlaExecutable,
-                        output_buffer_counts: Optional[Sequence[int]], handlers,
-                        kept_var_idx, *args):
+                        output_buffer_counts: Optional[Sequence[int]],
+                        result_handlers, kept_var_idx, *args):
   input_bufs = [
-      list(
-          itertools.chain.from_iterable(
-              device_put(x, device)
-              for i, x in enumerate(args)
-              if x is not core.token and i in kept_var_idx))
+      util.flatten(
+        device_put(x, device) for i, x in enumerate(args) if i in kept_var_idx)
       for device in compiled.local_devices()
   ]
   out_bufs = [
@@ -444,10 +479,10 @@ def _execute_replicated(name: str, compiled: XlaExecutable,
   ]
   check_special(name, out_bufs)
   if output_buffer_counts is None:
-    return (handlers[0](*out_bufs),)
+    return (result_handlers[0](*out_bufs),)
   return tuple(
       handler(*bs) for handler, bs in
-      unsafe_zip(handlers, util.unflatten(out_bufs, output_buffer_counts)))
+      unsafe_zip(result_handlers, util.unflatten(out_bufs, output_buffer_counts)))
 
 
 def _execute_trivial(jaxpr, device: Optional[Device], consts, avals, handlers,
@@ -469,7 +504,8 @@ class XlaComputation:
   _donated_invars: Optional[Sequence[bool]]
 
   def __init__(self, name: str, hlo, is_trivial: bool,
-               donated_invars: Optional[Sequence[bool]], *compile_args):
+               donated_invars: Optional[Sequence[bool]],
+               **compile_args):
     self.name = name
     self._hlo = hlo
     self._is_trivial = is_trivial
@@ -480,21 +516,34 @@ class XlaComputation:
   def is_trivial(self):
     return self._is_trivial
 
-  def hlo(self):
+  def hlo(self) -> xc.XlaComputation:
     if self.is_trivial():
       raise ValueError("A trivial computation has no HLO")
-    return self._hlo
+    if isinstance(self._hlo, xc.XlaComputation):
+      return self._hlo
+    return xe.mlir.mlir_module_to_xla_computation(
+        mlir.module_to_string(self._hlo),
+        use_tuple_args=self.compile_args["tuple_args"])
+
+  def mhlo(self) -> str:
+    if self.is_trivial():
+      raise ValueError("A trivial computation has no MHLO")
+    if isinstance(self._hlo, xc.XlaComputation):
+      return xe.mlir.xla_computation_to_mlir_module(self._hlo)
+    return mlir.module_to_string(self._hlo)
 
   def compile(self) -> 'XlaCompiledComputation':
     if self._executable is None:
       if self.is_trivial():
         self._executable = XlaCompiledComputation.from_trivial_jaxpr(
-            *self.compile_args)
+            **self.compile_args)
       else:
         self._executable = XlaCompiledComputation.from_xla_computation(
-            self.name, self.hlo(), *self.compile_args)
+            self.name, self._hlo, **self.compile_args)
+
     return self._executable
 
+@profiler.annotate_function
 def backend_compile(backend, built_c, options):
   # we use a separate function call to ensure that XLA compilation appears
   # separately in Python profiling results
@@ -504,20 +553,28 @@ def backend_compile(backend, built_c, options):
 xla.backend_compile = backend_compile
 
 def compile_or_get_cached(backend, computation, compile_options):
-    # Avoid import cycle between jax and jax.experimental
-    from jax.experimental.compilation_cache import compilation_cache as cc
-    # Persistent compilation cache only implemented on TPU.
-    # TODO(skye): add warning when initializing cache on unsupported default platform
-    if cc.is_initialized() and backend.platform == 'tpu':
-        cached_executable = cc.get_executable(computation, compile_options, backend)
-        if cached_executable is not None:
-            logging.info('Persistent compilation cache hit')
-            return cached_executable
-        else:
-            compiled = backend_compile(backend, computation, compile_options)
-            cc.put_executable(computation, compile_options, compiled, backend)
-            return compiled
-    return backend_compile(backend, computation, compile_options)
+  # Avoid import cycle between jax and jax.experimental
+  from jax.experimental.compilation_cache import compilation_cache as cc
+
+  if isinstance(computation, ir.Module):
+    module_name = computation.operation.name
+    computation = mlir.module_to_string(computation)
+  else:
+    module_name = computation.name()
+
+  # Persistent compilation cache only implemented on TPU.
+  # TODO(skye): add warning when initializing cache on unsupported default platform
+  if cc.is_initialized() and backend.platform == 'tpu':
+      cached_executable = cc.get_executable(computation, compile_options, backend)
+      if cached_executable is not None:
+          logging.info('Persistent compilation cache hit for %s.', module_name)
+          return cached_executable
+      else:
+          compiled = backend_compile(backend, computation, compile_options)
+          cc.put_executable(module_name, computation, compile_options, compiled,
+                            backend)
+          return compiled
+  return backend_compile(backend, computation, compile_options)
 
 
 class XlaCompiledComputation:
@@ -532,21 +589,25 @@ class XlaCompiledComputation:
       name: str,
       xla_computation,
       nreps: int,
-      device,
+      device: Optional[Device],
       backend,
       tuple_args: bool,
       in_avals,
       out_avals,
       kept_var_idx) -> 'XlaCompiledComputation':
-    result_handlers = map(partial(aval_to_result_handler, device), out_avals)
+    sticky_device = device
+    result_handlers = map(partial(aval_to_result_handler, sticky_device),
+                          out_avals)
     options = xb.get_compile_options(
         num_replicas=nreps,
         num_partitions=1,
-        device_assignment=(device.id,) if device else None)
+        device_assignment=(sticky_device.id,) if sticky_device else None)
     options.parameter_is_tupled_arguments = tuple_args
-    compiled = compile_or_get_cached(backend, xla_computation, options)
+    with log_elapsed_time(f"Finished XLA compilation of {name} "
+                          "in {elapsed_time} sec"):
+      compiled = compile_or_get_cached(backend, xla_computation, options)
     buffer_counts = (None if len(out_avals) == 1 else
-                     [len(xla.aval_to_xla_shapes(aval)) for aval in out_avals])
+                     [aval_to_num_buffers(aval) for aval in out_avals])
     execute = _execute_compiled if nreps == 1 else _execute_replicated
     unsafe_call = partial(execute, name, compiled, buffer_counts,
                           result_handlers, kept_var_idx)
@@ -610,17 +671,21 @@ def _device_put_scalar(x, device):
 
 def _device_put_unit(_, device):
   backend = xb.get_device_backend(device)
-  return (backend.buffer_from_pyval(np.zeros((), dtype=np.dtype('bool')),
+  return (backend.buffer_from_pyval(np.zeros((), dtype=np.dtype(np.bool_)),
+                                    device),)
+
+def _device_put_token(_, device):
+  backend = xb.get_device_backend(device)
+  return (backend.buffer_from_pyval(np.zeros((), dtype=np.dtype(np.bool_)),
                                     device),)
 
 _scalar_types = dtypes.python_scalar_dtypes.keys()
 
-device_put_handlers: Dict[Any, Callable[[Any, Optional[Device]], Tuple[Any]]] = {
-  core.Unit: _device_put_unit
-}
+device_put_handlers: Dict[Any, Callable[[Any, Optional[Device]], Tuple[Any]]] = {}
 device_put_handlers.update((t, _device_put_array) for t in array_types)
 device_put_handlers.update((t, _device_put_scalar) for t in _scalar_types)
-device_put_handlers[core.Token] = lambda x, _: (x,)
+device_put_handlers[core.Unit] = _device_put_unit
+device_put_handlers[core.Token] = _device_put_token
 
 
 def _device_put_device_array(x: Union[device_array.DeviceArrayProtocol, device_array._DeviceArray], device: Optional[Device]):
@@ -669,9 +734,6 @@ xla.translations[device_put_p] = lambda c, x, device=None: x
 ad.deflinear2(device_put_p, lambda cotangent, _, **kwargs: [cotangent])
 masking.defvectorized(device_put_p)
 batching.defvectorized(device_put_p)
-
-# TODO(phawkins): remove mlir->dispatch dependency and move this to the top.
-import jax.interpreters.mlir as mlir
 
 def _device_put_lowering(ctx, avals_in, avals_out, x, *, device):
   return [x]

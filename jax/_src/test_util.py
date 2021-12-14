@@ -39,6 +39,7 @@ from jax._src.util import prod, unzip2
 from jax.tree_util import tree_multimap, tree_all, tree_map, tree_reduce
 from jax._src.lib import xla_bridge
 from jax._src import dispatch
+from jax.interpreters import mlir
 from jax.interpreters import xla
 from jax.experimental.maps import mesh
 
@@ -91,6 +92,39 @@ def _dtype(x):
 def num_float_bits(dtype):
   return _dtypes.finfo(_dtypes.canonicalize_dtype(dtype)).bits
 
+def to_default_dtype(arr):
+  """Convert a value to an array with JAX's default dtype.
+
+  This is generally used for type conversions of values returned by numpy functions,
+  to make their dtypes take into account the state of the ``jax_enable_x64`` and
+  ``jax_default_dtype_bits`` flags.
+  """
+  arr = np.asarray(arr)
+  dtype = _dtypes._default_types.get(arr.dtype.kind)
+  return arr.astype(_dtypes.canonicalize_dtype(dtype)) if dtype else arr
+
+def with_jax_dtype_defaults(func, use_defaults=True):
+  """Return a version of a function with outputs that match JAX's default dtypes.
+
+  This is generally used to wrap numpy functions within tests, in order to make
+  their default output dtypes match those of corresponding JAX functions, taking
+  into account the state of the ``jax_enable_x64`` and ``jax_default_dtype_bits``
+  flags.
+
+  Args:
+    use_defaults : whether to convert any given output to the default dtype. May be
+      a single boolean, in which case it specifies the conversion for all outputs,
+      or may be a a pytree with the same structure as the function output.
+  """
+  @functools.wraps(func)
+  def wrapped(*args, **kwargs):
+    result = func(*args, **kwargs)
+    if isinstance(use_defaults, bool):
+      return tree_map(to_default_dtype, result) if use_defaults else result
+    else:
+      f = lambda arr, use_default: to_default_dtype(arr) if use_default else arr
+      return tree_map(f, result, use_defaults)
+  return wrapped
 
 def is_sequence(x):
   try:
@@ -368,18 +402,25 @@ def count_jit_and_pmap_compiles():
   # No need to clear any caches since we generally jit and pmap fresh callables
   # in tests.
 
-  jaxpr_subcomp = xla.jaxpr_subcomp
+  xla_jaxpr_subcomp = xla.jaxpr_subcomp
+  mlir_jaxpr_subcomp = mlir.jaxpr_subcomp
   count = [0]
 
-  def jaxpr_subcomp_and_count(*args, **kwargs):
+  def xla_jaxpr_subcomp_and_count(*args, **kwargs):
     count[0] += 1
-    return jaxpr_subcomp(*args, **kwargs)
+    return xla_jaxpr_subcomp(*args, **kwargs)
 
-  xla.jaxpr_subcomp = jaxpr_subcomp_and_count
+  def mlir_jaxpr_subcomp_and_count(*args, **kwargs):
+    count[0] += 1
+    return mlir_jaxpr_subcomp(*args, **kwargs)
+
+  xla.jaxpr_subcomp = xla_jaxpr_subcomp_and_count
+  mlir.jaxpr_subcomp = mlir_jaxpr_subcomp_and_count
   try:
     yield count
   finally:
-    xla.jaxpr_subcomp = jaxpr_subcomp
+    xla.jaxpr_subcomp = xla_jaxpr_subcomp
+    mlir.jaxpr_subcomp = mlir_jaxpr_subcomp
 
 @contextmanager
 def assert_num_jit_and_pmap_compilations(times):
@@ -968,6 +1009,9 @@ class JaxTestCase(parameterized.TestCase):
     ignore_space_re = re.compile(r'\s*\n\s*')
     expected_clean = re.sub(ignore_space_re, '\n', expected.strip())
     what_clean = re.sub(ignore_space_re, '\n', what.strip())
+    if what_clean != expected_clean:
+      # Print it so we can copy-and-paste it into the test
+      print(f"Found\n{what}\n")
     self.assertMultiLineEqual(expected_clean, what_clean,
                               msg="Found\n{}\nExpecting\n{}".format(what, expected))
 

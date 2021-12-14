@@ -7,10 +7,10 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 #    and update the sha256 with the result.
 http_archive(
     name = "org_tensorflow",
-    sha256 = "484f66e25e5ffad3cd6c7bad2fb88e5fe63c138fbb55a1fba7f45224b43ec671",
-    strip_prefix = "tensorflow-dcb95ca4a6efd9534f72047ffbc3f9c8cbd1fca9",
+    sha256 = "e6e68270b7fb0dda26656f4985b3d118b5a9d3fa60433ced42ce2fc5676716d5",
+    strip_prefix = "tensorflow-d9b47d5722fc08c5d06afba9f63177de266801f5",
     urls = [
-        "https://github.com/tensorflow/tensorflow/archive/dcb95ca4a6efd9534f72047ffbc3f9c8cbd1fca9.tar.gz",
+        "https://github.com/tensorflow/tensorflow/archive/d9b47d5722fc08c5d06afba9f63177de266801f5.tar.gz",
     ],
 )
 

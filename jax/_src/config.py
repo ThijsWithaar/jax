@@ -179,7 +179,8 @@ class Config:
   def define_bool_state(
     self, name: str, default: bool, help: str, *,
     update_global_hook: Optional[Callable[[bool], None]] = None,
-    update_thread_local_hook: Optional[Callable[[Optional[bool]], None]] = None):
+    update_thread_local_hook: Optional[Callable[[Optional[bool]], None]] = None,
+    extra_description: str = ""):
     """Set up thread-local state and return a contextmanager for managing it.
 
     This function is a convenience wrapper. It defines a flag, environment
@@ -201,6 +202,8 @@ class Config:
       update_thread_local_hook: a optional callback that is called with the
         updated value of the thread-local state when it is altered or set
         initially.
+      extra_description: string, optional: extra information to add to the
+        summary description.
 
     Returns:
       A contextmanager to control the thread-local state value.
@@ -235,7 +238,8 @@ class Config:
       return val if val is not unset else self._read(name)
     setattr(Config, name, property(get_state))
 
-    return _StateContextManager(name, help, update_thread_local_hook)
+    return _StateContextManager(name, help, update_thread_local_hook,
+                                extra_description=extra_description)
 
   def define_enum_state(
       self, name: str, enum_values: List[str], default: Optional[str],
@@ -332,10 +336,11 @@ class Config:
 
 class _StateContextManager:
   def __init__(self, name, help, update_thread_local_hook,
-               validate_new_val_hook: Optional[Callable[[Any], None]] = None):
+               validate_new_val_hook: Optional[Callable[[Any], None]] = None,
+               extra_description: str = ""):
     self._name = name
     self.__name__ = name[4:] if name.startswith('jax_') else name
-    self.__doc__ = f"Context manager for `{name}` config option.\n\n{help}"
+    self.__doc__ = f"Context manager for `{name}` config option{extra_description}.\n\n{help}"
     self._update_thread_local_hook = update_thread_local_hook
     self._validate_new_val_hook = validate_new_val_hook
 
@@ -458,6 +463,15 @@ flags.DEFINE_bool(
         'Has no effect on TPU, since only the outfeed mechanism is implemented.'
     )
 )
+flags.DEFINE_bool(
+    'jax_host_callback_ad_transforms',
+    bool_env('JAX_HOST_CALLBACK_AD_TRANSFORMS', False),
+    help=(
+        'Enable support for jvp/vjp for the host_callback primitives. Default is '
+        'False, which means that host_callback operates only on primals. '
+        'The flag exists only temporarily, for backward compatibility.'
+    )
+)
 
 enable_checks = config.define_bool_state(
     name='jax_enable_checks',
@@ -498,8 +512,8 @@ log_compiles = config.define_bool_state(
           'option is set, the log level is WARNING; otherwise the level is '
           'DEBUG.'))
 
-gsda_out = config.define_bool_state(
-    name='jax_gsda_out',
+parallel_functions_output_gda = config.define_bool_state(
+    name='jax_parallel_functions_output_gda',
     default=False,
     help='If True, pjit will output GSDAs.')
 
@@ -518,7 +532,8 @@ enable_custom_prng = config.define_bool_state(
           'pseudo-random number generator implementations. This will '
           'be enabled by default in future versions of JAX, at which point '
           'disabling it will be considered deprecated. In a version '
-          'after that the flag will be removed altogether.'))
+          'after that the flag will be removed altogether.'),
+    extra_description=" (transient)")
 
 default_prng_impl = config.define_enum_state(
     name='jax_default_prng_impl',
@@ -536,6 +551,14 @@ hlo_source_file_canonicalization_regex = config.define_string_state(
           'This can be used to avoid spurious cache misses when using the '
           'persistent compilation cache, which includes HLO metadata in the '
           'cache key.'))
+
+config.define_enum_state(
+    name='jax_default_dtype_bits',
+    enum_values=['32', '64'],
+    default='64',
+    help=('Specify bit width of default dtypes, either 32-bit or 64-bit. '
+          'This is a temporary flag that will be used during the process '
+          'of deprecating the ``jax_enable_x64`` flag.'))
 
 def _update_x64_global(val):
   lib.jax_jit.global_state().enable_x64 = val

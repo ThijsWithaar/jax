@@ -39,22 +39,15 @@ bfloat16: type = xla_client.bfloat16
 _bfloat16_dtype: np.dtype = np.dtype(bfloat16)
 
 # Default types.
-
 bool_: type = np.bool_
-int_: type = np.int64
-uint: type = np.uint64
-float_: type = np.float64
-complex_: type = np.complex128
-
-# TODO(phawkins): change the above defaults to:
-# int_ = np.int32
-# uint = np.uint32
-# float_ = np.float32
-# complex_ = np.complex64
+int_: type = np.int32 if config.jax_default_dtype_bits == '32' else np.int64
+uint: type = np.uint32 if config.jax_default_dtype_bits == '32' else np.uint64
+float_: type = np.float32 if config.jax_default_dtype_bits == '32' else np.float64
+complex_: type = np.complex64 if config.jax_default_dtype_bits == '32' else np.complex128
 _default_types = {'b': bool_, 'i': int_, 'u': uint, 'f': float_, 'c': complex_}
 
 # Trivial vectorspace datatype needed for tangent values of int/bool primals
-float0 = np.dtype([('float0', np.void, 0)])
+float0: np.dtype = np.dtype([('float0', np.void, 0)])
 
 _dtype_to_32bit_dtype = {
     np.dtype('int64'): np.dtype('int32'),
@@ -343,7 +336,9 @@ def is_python_scalar(x):
 
 def dtype(x, *, canonicalize=False):
   """Return the dtype object for a value or type, optionally canonicalized based on X64 mode."""
-  if isinstance(x, type) and x in python_scalar_dtypes:
+  if x is None:
+    raise ValueError(f"Invalid argument to dtype: {x}.")
+  elif isinstance(x, type) and x in python_scalar_dtypes:
     dt = python_scalar_dtypes[x]
   elif type(x) in python_scalar_dtypes:
     dt = python_scalar_dtypes[type(x)]
@@ -373,7 +368,7 @@ def result_type(*args):
   """Convenience function to apply JAX argument dtype promotion."""
   if len(args) == 0:
     raise ValueError("at least one array or dtype is required")
-  dtype, weak_type = _lattice_result_type(*args)
+  dtype, weak_type = _lattice_result_type(*(float_ if arg is None else arg for arg in args))
   if weak_type:
     dtype = _default_types['f' if dtype == _bfloat16_dtype else dtype.kind]
   return canonicalize_dtype(dtype)

@@ -53,6 +53,14 @@ def tearDownModule():
   jtu.restore_spmd_lowering_flag()
 
 
+def create_gda(global_shape, global_mesh, mesh_axes):
+  global_data = np.arange(
+      prod(global_shape), dtype=np.float32).reshape(global_shape)
+
+  return global_device_array.GlobalDeviceArray.from_callback(
+      global_shape, global_mesh, mesh_axes, lambda idx: global_data[idx])
+
+
 @curry
 def check_1d_2d_mesh(f, set_mesh):
   return parameterized.named_parameters(
@@ -594,10 +602,10 @@ class PJitTest(jtu.BufferDonationTestCase):
         lambda: exe(x_i32, x_i32))
 
 
-class GSDAPjitTest(jtu.JaxTestCase):
+class GDAPjitTest(jtu.JaxTestCase):
 
   @jtu.with_mesh([('x', 4), ('y', 2)])
-  def test_pjit_gsda_single_output(self):
+  def test_pjit_gda_single_output(self):
     global_mesh = create_global_mesh((4, 2), ('x', 'y'))
     global_input_shape = (8, 2)
     mesh_axes = P('x', 'y')
@@ -609,7 +617,7 @@ class GSDAPjitTest(jtu.JaxTestCase):
     gda_obj = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes, cb)
 
-    with jax._src.config.gsda_out(True):
+    with jax._src.config.parallel_functions_output_gda(True):
       @partial(pjit, in_axis_resources=FROM_GDA, out_axis_resources=P('x', 'y'))
       def f(x):
         return x @ x.T
@@ -629,7 +637,7 @@ class GSDAPjitTest(jtu.JaxTestCase):
         f(input_data)
 
   @jtu.with_mesh([('x', 4), ('y', 2)])
-  def test_pjit_gsda_multi_input_multi_output(self):
+  def test_pjit_gda_multi_input_multi_output(self):
     global_mesh = create_global_mesh((4, 2), ('x', 'y'))
     global_input_shape = (8, 2)
     input_data = np.arange(
@@ -638,19 +646,19 @@ class GSDAPjitTest(jtu.JaxTestCase):
       return input_data[index]
 
     mesh_axes1 = P('x', 'y')
-    gsda1 = global_device_array.GlobalDeviceArray.from_callback(
+    gda1 = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes1, cb)
     mesh_axes2 = P('x')
-    gsda2 = global_device_array.GlobalDeviceArray.from_callback(
+    gda2 = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes2, cb)
     mesh_axes3 = P(('x', 'y'))
-    gsda3 = global_device_array.GlobalDeviceArray.from_callback(
+    gda3 = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes3, cb)
     mesh_axes4 = P(None)
-    gsda4 = global_device_array.GlobalDeviceArray.from_callback(
+    gda4 = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes4, cb)
 
-    with jax._src.config.gsda_out(True):
+    with jax._src.config.parallel_functions_output_gda(True):
       @partial(
           pjit,
           # `FROM_GDA` will be replicated for all the inputs.
@@ -658,7 +666,7 @@ class GSDAPjitTest(jtu.JaxTestCase):
           out_axis_resources=(mesh_axes1, mesh_axes4, mesh_axes2, mesh_axes3))
       def f(x, y, z, a):
         return x @ x.T, y, z, a
-      out1, out2, out3, out4 = f(gsda1, gsda2, gsda3, gsda4)
+      out1, out2, out3, out4 = f(gda1, gda2, gda3, gda4)
 
       self.assertIsInstance(out1, global_device_array.GlobalDeviceArray)
       self.assertEqual(out1.shape, (8, 8))
@@ -702,7 +710,7 @@ class GSDAPjitTest(jtu.JaxTestCase):
         self.assertArraysEqual(s.data, input_data[s.index])
 
   @jtu.with_mesh([('x', 4), ('y', 2)])
-  def test_pjit_gsda_mixed_inputs(self):
+  def test_pjit_gda_mixed_inputs(self):
     global_mesh = create_global_mesh((4, 2), ('x', 'y'))
     global_input_shape = (8, 2)
     mesh_axes = P('x', 'y')
@@ -714,7 +722,7 @@ class GSDAPjitTest(jtu.JaxTestCase):
     gda_obj = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes, cb)
 
-    with jax._src.config.gsda_out(True):
+    with jax._src.config.parallel_functions_output_gda(True):
       @partial(pjit,
                in_axis_resources=(FROM_GDA, P('x', 'y')),
                out_axis_resources=(P('x', 'y'), P(('x', 'y'))))
@@ -737,8 +745,37 @@ class GSDAPjitTest(jtu.JaxTestCase):
       for s in out2.local_shards:
         self.assertArraysEqual(s.data, expected_matrix_mul[s.index])
 
+  @jtu.with_mesh([('x', 4), ('y', 2)])
+  def test_pjit_gda_non_gda_inputs(self):
+    input_shape = (8, 2)
+    input_data = np.arange(prod(input_shape)).reshape(input_shape)
+
+    with jax._src.config.parallel_functions_output_gda(True):
+      @partial(pjit,
+               in_axis_resources=(None, P('x', 'y')),
+               out_axis_resources=(P('x', 'y'), P(('x', 'y'))))
+      def f(x, y):
+        return x @ x.T, y @ y.T
+
+      expected_matrix_mul = input_data @ input_data.T
+      out1, out2 = f(input_data, input_data)
+
+      self.assertIsInstance(out1, global_device_array.GlobalDeviceArray)
+      self.assertEqual(out1.shape, (8, 8))
+      self.assertEqual(out1.local_shards[0].data.shape, (2, 4))
+      self.assertDictEqual(out1._global_mesh.shape, {'x': 4, 'y': 2})
+      for s in out1.local_shards:
+        self.assertArraysEqual(s.data, expected_matrix_mul[s.index])
+
+      self.assertIsInstance(out2, global_device_array.GlobalDeviceArray)
+      self.assertEqual(out2.shape, (8, 8))
+      self.assertEqual(out2.local_shards[0].data.shape, (1, 8))
+      self.assertDictEqual(out2._global_mesh.shape, {'x': 4, 'y': 2})
+      for s in out2.local_shards:
+        self.assertArraysEqual(s.data, expected_matrix_mul[s.index])
+
   @jtu.with_mesh([('x', 2), ('y', 2)])
-  def test_pjit_gsda_mesh_mismatch(self):
+  def test_pjit_gda_mesh_mismatch(self):
     global_mesh = create_global_mesh((4, 2), ('x', 'y'))
     global_input_shape = (8, 2)
     mesh_axes = ['x', 'y']
@@ -759,7 +796,7 @@ class GSDAPjitTest(jtu.JaxTestCase):
       f(gda_obj)
 
   @jtu.with_mesh([('x', 4), ('y', 2)])
-  def test_pjit_gsda_wrong_resource_for_gsda_input(self):
+  def test_pjit_gda_wrong_resource_for_gda_input(self):
     global_mesh = create_global_mesh((4, 2), ('x', 'y'))
     global_input_shape = (8, 2)
     mesh_axes = ['x']
@@ -770,17 +807,86 @@ class GSDAPjitTest(jtu.JaxTestCase):
 
     gda_obj = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes, cb)
-    with self.assertRaisesWithLiteralMatch(ValueError, (
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
         "Got an input GDA to pjit with different partitioning than specified "
-        "in the in_axis_resources argument to pjit. The paritioning must "
+        'in the in_axis_resources argument to pjit. The partitioning must '
         'match, or use `jax.experimental.pjit.FROM_GDA` in `in_axis_resources`. '
-        "Got GDA spec: <partitions=(('x',),) sync=2>, "
-        "pjit spec: <partitions=(('x',), ('y',)) sync=2>")):
+        "Got GDA spec: PartitionSpec('x',) and "
+        "pjit spec: PartitionSpec('x', 'y') "
+        'for GDA: GlobalDeviceArray(shape=(8, 2), dtype=float32)'):
       @partial(pjit, in_axis_resources=P('x', 'y'), out_axis_resources=P('x', 'y'))
       def f(x):
         return x
 
       f(gda_obj)
+
+  @jtu.with_mesh([('x', 4), ('y', 2)])
+  def test_pjit_gda_caching(self):
+    global_mesh = create_global_mesh((4, 2), ('x', 'y'))
+    input_shape = (8, 2)
+    mesh_axes = P('x', 'y')
+    input_data = np.arange(
+        prod(input_shape), dtype=np.float32).reshape(input_shape)
+    def cb(index):
+      return input_data[index]
+
+    gda_obj = global_device_array.GlobalDeviceArray.from_callback(
+        input_shape, global_mesh, mesh_axes, cb)
+
+    trace_counter = [0]
+    @partial(pjit, in_axis_resources=mesh_axes, out_axis_resources=P('x', 'y'))
+    def f(x, y):
+      trace_counter[0] += 1
+      return x @ y.T
+
+    f(gda_obj, gda_obj)
+    self.assertListEqual(trace_counter, [1])
+    f(gda_obj, gda_obj)
+    self.assertListEqual(trace_counter, [1])
+    f(input_data, input_data)
+    self.assertListEqual(trace_counter, [2])
+    f(gda_obj, input_data)
+    self.assertListEqual(trace_counter, [3])
+
+  @jtu.with_mesh([('x', 4), ('y', 2)])
+  def test_partition_spec_mismatch_semantically_equivalent(self):
+    global_mesh = create_global_mesh((4, 2), ('x', 'y'))
+    global_input_shape = (8, 2)
+    mesh_axes = [None]
+    global_input_data = np.arange(
+        prod(global_input_shape), dtype=np.float32).reshape(global_input_shape)
+
+    def cb(index):
+      return global_input_data[index]
+
+    with jax._src.config.parallel_functions_output_gda(True):
+      gda_obj = global_device_array.GlobalDeviceArray.from_callback(
+          global_input_shape, global_mesh, mesh_axes, cb)
+
+      @partial(pjit, in_axis_resources=P(None), out_axis_resources=P(None))
+      def f(x):
+        return x
+
+      output_gda = f(gda_obj)
+      # Ensure output_gda._mesh_axes = P() is matched with P(None).
+      self.assertEqual(output_gda._mesh_axes, ())
+      # P(None) is in_axis_resources.
+      f(output_gda)
+
+  def test_from_gda_duplicates(self):
+    global_mesh = create_global_mesh((1, 2), ('x', 'y'))
+    global_input_shape = (8, 2)
+    mesh_axes = ['x', 'y']
+    input_gda = create_gda(global_input_shape, global_mesh, mesh_axes)
+
+    # It's occasionally possible to end up with two FROM_GDA singletons (e.g. if
+    # pickling in_axis_resources and sending to other processes). Make sure this
+    # this doesn't cause an error to avoid user confusion.
+    from_gda_dup = pjit_lib._FromGsdaSingleton()
+    with mesh(global_mesh.devices, global_mesh.axis_names):
+      pjit(lambda x: x, in_axis_resources=from_gda_dup, out_axis_resources=None)(
+          input_gda)
 
 
 def spec_regex(s):
@@ -1025,10 +1131,10 @@ class UtilTest(jtu.JaxTestCase):
     for spec in special_specs:
       roundtrip(spec)
 
-    rng = np.random.default_rng(1)
+    rng = self.rng()
     for i in range(100):
       spec = [()] * dims
-      for axis in rng.permutation(mesh_axes)[:rng.integers(low=1, high=len(mesh_axes) + 1)]:
+      for axis in rng.permutation(mesh_axes)[:rng.randint(low=1, high=len(mesh_axes) + 1)]:
         spec[rng.choice(dims)] += (axis,)
       roundtrip(P(*spec))
 

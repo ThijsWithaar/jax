@@ -24,18 +24,19 @@ from jax import core
 from jax import lax
 from jax import tree_util
 from jax import vmap
+from jax.experimental.sparse._base import JAXSparse
+from jax.experimental.sparse.util import _safe_asarray
 from jax.interpreters import batching
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 import jax.numpy as jnp
 from jax.interpreters import ad
-from jax.util import safe_zip, unzip2
+from jax.util import safe_zip, unzip2, split_list
 from jax._src.api_util import flatten_axes
 from jax._src.lax.lax import (
   ranges_like, remaining, _dot_general_batch_dim_nums, _dot_general_shape_rule,
   DotDimensionNumbers)
 from jax._src.numpy.lax_numpy import _unique
-from jax.experimental.sparse import ops
 
 Dtype = Any
 Shape = Tuple[int, ...]
@@ -72,12 +73,13 @@ def _bcoo_nse(mat, n_batch=0, n_dense=0):
   mask = mask.sum(list(range(n_batch, mask.ndim)))
   return mask.max()
 
-def _bcoo_sum_duplicates(data, indices, shape, nse=None):
+def _bcoo_sum_duplicates(data, indices, shape, nse=None, remove_zeros=True):
   if nse is None and isinstance(jnp.array(0), core.Tracer):
     raise ValueError("When used with JIT, vmap, or another transform, sum_duplicates() "
                      "requires passing a non-None value for the nse argument.")
   props = _validate_bcoo(data, indices, shape)
-  f = functools.partial(_bcoo_sum_duplicates_unbatched, shape=shape[props.n_batch:], nse=nse)
+  f = functools.partial(_bcoo_sum_duplicates_unbatched, shape=shape[props.n_batch:],
+                        nse=nse, remove_zeros=remove_zeros)
   for _ in range(props.n_batch):
     f = broadcasting_vmap(f)
   data_unique, indices_unique, nse_out = f(data, indices)
@@ -87,21 +89,29 @@ def _bcoo_sum_duplicates(data, indices, shape, nse=None):
     indices_unique = lax.slice_in_dim(indices_unique, 0, nse, axis=props.n_batch)
   return data_unique, indices_unique
 
-def _bcoo_sum_duplicates_unbatched(data, indices, *, shape, nse):
+def _bcoo_sum_duplicates_unbatched(data, indices, *, shape, nse, remove_zeros):
   props = _validate_bcoo(data, indices, shape)
+  assert props.n_batch == 0
   if not props.n_sparse:
     nse = 1 if nse is None else nse
     data_unique = jnp.zeros_like(data, shape=(nse, *data.shape[1:])).at[0].set(data.sum(0))
     indices_unique = jnp.zeros_like(indices, shape=(nse, 0))
     return data_unique, indices_unique, nse
+  fill_value = jnp.array(shape[:props.n_sparse], dtype=indices.dtype)
+  out_of_bounds = (indices >= fill_value).any(-1, keepdims=True)
+  if remove_zeros:
+    data_all_zero = (data == 0).all(range(props.n_batch + 1, data.ndim))[:, None]
+    out_of_bounds = out_of_bounds | data_all_zero
+  indices = jnp.where(out_of_bounds, fill_value, indices)
   if nse is None:
     indices_unique, inv_idx, nse = _unique(
       indices, axis=0, return_inverse=True, return_true_size=True,
-      size=props.nse, fill_value=jnp.array(shape[:props.n_sparse]))
+      size=props.nse, fill_value=fill_value)
+    nse = nse - (indices == fill_value).any()
   else:
     indices_unique, inv_idx = jnp.unique(
-      indices, axis=0, return_inverse=True, size=nse,
-      fill_value=jnp.array(shape[:props.n_sparse]))
+      indices, axis=0, return_inverse=True,
+      size=nse, fill_value=fill_value)
   data_shape = [indices_unique.shape[0], *data.shape[1:]]
   data_unique = jnp.zeros(data_shape, data.dtype).at[inv_idx].add(data)
   oob_mask = jnp.all(indices_unique == jnp.array(shape[:props.n_sparse]), 1)
@@ -876,13 +886,62 @@ def _bcoo_spdot_general_batch_rule(batched_args, batch_dims, *, dimension_number
                                  lhs_shape=new_lhs_shape, rhs_shape=new_rhs_shape)
   return batched_out, (result_batch_dim, result_batch_dim)
 
-# TODO(JVP): jvp, transpose
+
+def _bcoo_spdot_general_jvp(primals, tangents, **kwds):
+  lhs_data, lhs_indices, rhs_data, rhs_indices = primals
+  lhs_data_dot, lhs_indices_dot, rhs_data_dot, rhs_indices_dot = tangents
+  primals_out = bcoo_spdot_general(*primals, **kwds)
+  assert type(lhs_indices_dot) is ad.Zero
+  assert type(rhs_indices_dot) is ad.Zero
+  data_dot_out = 0
+  if type(lhs_data_dot) is not ad.Zero:
+    data_dot_out += bcoo_spdot_general(lhs_data_dot, lhs_indices, rhs_data, rhs_indices, **kwds)[0]
+  if type(rhs_data_dot) is not ad.Zero:
+    data_dot_out += bcoo_spdot_general(lhs_data, lhs_indices, rhs_data_dot, rhs_indices, **kwds)[0]
+  return primals_out, [data_dot_out, ad.Zero.from_value(primals_out[1])]
+
+# TODO(JVP): transpose rule
 batching.primitive_batchers[bcoo_spdot_general_p] = _bcoo_spdot_general_batch_rule
+ad.primitive_jvps[bcoo_spdot_general_p] = _bcoo_spdot_general_jvp
 xla.register_translation(bcoo_spdot_general_p, xla.lower_fun(
     _bcoo_spdot_general_impl, multiple_results=True, new_style=True))
 
 #----------------------------------------------------------------------
 # BCOO functions that maybe should be primitives?
+
+def bcoo_broadcast_in_dim(data, indices, *, shape, new_shape, broadcast_dimensions):
+  """BCOO equivalent of lax.broadcast_in_dim"""
+  if len(shape) != len(broadcast_dimensions):
+    raise ValueError(f"shape={shape} and broadcast_dimensions={broadcast_dimensions} must have the same length")
+  props = _validate_bcoo(data, indices, shape)
+  batch_dims, sparse_dims, dense_dims = split_list(broadcast_dimensions, [props.n_batch, props.n_sparse])
+
+  if max(batch_dims, default=0) > min(sparse_dims, default=len(new_shape)):
+    raise ValueError("Cannot mix batch and sparse dimensions during broadcast_in_dim")
+  if max(sparse_dims, default=0) > min(dense_dims, default=len(new_shape)):
+    raise ValueError("Cannot mix sparse and dense dimensions during broadcast_in_dim")
+
+  new_n_batch = props.n_batch and 1 + max(broadcast_dimensions[:props.n_batch])
+  new_n_dense = props.n_dense and len(new_shape) - min(broadcast_dimensions[-props.n_dense:])
+  new_n_sparse = len(new_shape) - new_n_batch - new_n_dense
+
+  if np.prod(shape[props.n_batch: props.n_batch + props.n_sparse]) != np.prod(new_shape[new_n_batch:new_n_batch + new_n_sparse]):
+    raise NotImplementedError("Adding sparse dimensions with lengths != 1")
+  nse = props.nse
+
+  # batch & dense dimensions
+  new_data = lax.broadcast_in_dim(data,
+      shape=(*new_shape[:new_n_batch], nse, *new_shape[new_n_batch + new_n_sparse:]),
+      broadcast_dimensions=(*batch_dims, new_n_batch, *(b + 1 - new_n_sparse for b in dense_dims)))
+  new_indices = lax.broadcast_in_dim(indices,
+      shape=(*new_shape[:new_n_batch], nse, props.n_sparse),
+      broadcast_dimensions=(*batch_dims, new_n_batch, new_n_batch + 1))
+
+  # sparse dimensions
+  new_indices = (jnp.zeros_like(new_indices, shape=(*new_shape[:new_n_batch], nse, new_n_sparse))
+                   .at[..., jnp.array(sparse_dims, int) - new_n_batch].set(new_indices))
+
+  return new_data, new_indices
 
 def _tuple_replace(tup, ind, val):
   return tuple(val if i == ind else t for i, t in enumerate(tup))
@@ -939,6 +998,46 @@ def bcoo_reduce_sum(data, indices, *, shape, axes):
   out_shape = tuple(shape[i] for i in range(len(shape)) if i not in axes)
   return data, indices, out_shape
 
+def bcoo_multiply_sparse(lhs_data, lhs_indices, rhs_data, rhs_indices, *, lhs_shape, rhs_shape):
+  lhs = _validate_bcoo(lhs_data, lhs_indices, lhs_shape)
+  rhs = _validate_bcoo(rhs_data, rhs_indices, rhs_shape)
+  if len(lhs_shape) != len(rhs_shape):
+    # Similar requirement as lax.mul:
+    raise TypeError("bcoo_multiply_sparse: arrays must have same number of dimensions, "
+                    f"got {lhs_shape}, {rhs_shape}")
+  if (lhs.n_batch, lhs.n_sparse, lhs.n_dense) != (rhs.n_batch, rhs.n_sparse, rhs.n_dense):
+    raise NotImplementedError("bcoo_multiply_sparse: arrays with differing numbers of "
+                              f"batch & dense dimensions: {lhs}, {rhs}")
+  _mul = functools.partial(_bcoo_multiply_sparse_unbatched,
+                           lhs_shape=lhs_shape[lhs.n_batch:],
+                           rhs_shape=rhs_shape[rhs.n_batch:])
+  for _ in range(lhs.n_batch):
+    _mul = broadcasting_vmap(_mul)
+  data, indices = _mul(lhs_data, lhs_indices, rhs_data, rhs_indices)
+  return data, indices, jnp.broadcast_shapes(lhs_shape, rhs_shape)
+
+def _bcoo_multiply_sparse_unbatched(lhs_data, lhs_indices, rhs_data, rhs_indices, *, lhs_shape, rhs_shape):
+  lhs = _validate_bcoo(lhs_data, lhs_indices, lhs_shape)
+  rhs = _validate_bcoo(rhs_data, rhs_indices, rhs_shape)
+  assert lhs.n_batch == rhs.n_batch == 0
+  dims = jnp.array([i for i, (s1, s2) in enumerate(safe_zip(lhs_shape[:lhs.n_sparse], rhs_shape[:rhs.n_sparse]))
+                    if s1 != 1 and s2 != 1], dtype=int)
+
+  # TODO(jakevdp): this nse can be tightened to min(lhs.nse, rhs.nse) if there
+  # is no broadcasting and indices are unique.
+  nse = lhs.nse * rhs.nse
+
+  # TODO(jakevdp): this is pretty inefficient. Can we do this membership check
+  # without constructing the full (lhs.nse, rhs.nse) masking matrix?
+  mask = jnp.all(lhs_indices[:, None, dims] == rhs_indices[:, dims], -1)
+  i_lhs, i_rhs = jnp.nonzero(mask, size=nse, fill_value=(lhs.nse, rhs.nse))
+  data = (lhs_data.at[i_lhs].get(mode='fill', fill_value=0) *
+          rhs_data.at[i_rhs].get(mode='fill', fill_value=0))
+  indices = jnp.maximum(
+      lhs_indices.at[i_lhs].get(mode='fill', fill_value=max(lhs_shape, default=0)),
+      rhs_indices.at[i_rhs].get(mode='fill', fill_value=max(rhs_shape, default=0)))
+  return data, indices
+
 def bcoo_multiply_dense(data, indices, v, *, shape):
   """Broadcasted elementwise multiplication between a BCOO array and a dense array."""
   # TODO(jakevdp): the logic here is similar to bcoo_extract... can we reuse that?
@@ -967,7 +1066,7 @@ def bcoo_multiply_dense(data, indices, v, *, shape):
   return _mul(data, indices, v)
 
 @tree_util.register_pytree_node_class
-class BCOO(ops.JAXSparse):
+class BCOO(JAXSparse):
   """Experimental batched COO matrix implemented in JAX
 
   Args:
@@ -1017,6 +1116,8 @@ class BCOO(ops.JAXSparse):
                  [0., 3., 0.],
                  [0., 0., 5.]], dtype=float32)
   """
+  # Note: additional BCOO methods are defined in transform.py
+
   data: jnp.ndarray
   indices: jnp.ndarray
   shape: Shape
@@ -1029,7 +1130,7 @@ class BCOO(ops.JAXSparse):
   def __init__(self, args, *, shape):
     # JAX transforms will sometimes instantiate pytrees with null values, so we
     # must catch that in the initialization of inputs.
-    self.data, self.indices = self._safe_asarray(args)
+    self.data, self.indices = _safe_asarray(args)
     super().__init__(args, shape=shape)
 
   @classmethod
@@ -1044,8 +1145,20 @@ class BCOO(ops.JAXSparse):
       raise NotImplementedError("BCOO.fromscipy with nonzero n_dense/n_batch")
     mat = mat.tocoo()
     data = jnp.asarray(mat.data)
-    indices = jnp.column_stack((mat.row, mat.col)).astype(index_dtype)
+    indices = jnp.column_stack((mat.row, mat.col)).astype(index_dtype or jnp.int32)
     return cls((data, indices), shape=mat.shape)
+
+  @classmethod
+  def _empty(cls, shape, *, dtype=None, index_dtype='int32', n_dense=0, n_batch=0):
+    """Create an empty BCOO instance. Public method is sparse.empty()."""
+    shape = tuple(shape)
+    n_sparse = len(shape) - n_dense - n_batch
+    if n_sparse < 0 or n_dense < 0 or n_batch < 0:
+      raise ValueError("Invalid inputs: shape={shape}, n_dense={n_dense}, n_batch={n_batch}")
+    batch_shape, sparse_shape, dense_shape = split_list(shape, [n_batch, n_sparse])
+    data = jnp.empty((*batch_shape, 0, *dense_shape), dtype)
+    indices = jnp.empty((*batch_shape, 0, n_sparse), index_dtype)
+    return cls((data, indices), shape=shape)
 
   def _unbatch(self):
     """Return an unbatched representation of the BCOO matrix."""
@@ -1055,7 +1168,7 @@ class BCOO(ops.JAXSparse):
     warnings.warn("_dedupe() is deprecated. Use sum_duplicates() instead.", FutureWarning)
     return self.sum_duplicates(nse=self.nse)
 
-  def sum_duplicates(self, nse=None):
+  def sum_duplicates(self, nse=None, remove_zeros=True):
     """Return a copy of the array with duplicate indices summed.
 
     Additionally, this operation will result in explicit zero entries removed, and
@@ -1071,8 +1184,12 @@ class BCOO(ops.JAXSparse):
         the output sparse representation; if it is larger than the number required, data
         will be padded with zeros and indices will be padded with out-of-bounds values.
         If it is smaller than the number required, data will be silently discarded.
+      remove_zeros : bool (default=True). If True, remove explicit zeros from the data
+        as part of summing duplicates. If False, then explicit zeros at unique indices
+        will remain among the specified elements.
     """
-    data, indices = _bcoo_sum_duplicates(self.data, self.indices, self.shape, nse=nse)
+    data, indices = _bcoo_sum_duplicates(self.data, self.indices, self.shape,
+                                         nse=nse, remove_zeros=remove_zeros)
     return BCOO((data, indices), shape=self.shape)
 
   def todense(self):
@@ -1089,40 +1206,6 @@ class BCOO(ops.JAXSparse):
   def tree_flatten(self):
     return (self.data, self.indices), {"shape": self.shape}
 
-  # TODO(jakevdp): refactor to avoid circular imports - we can use the same strategy
-  #                we use when adding methods to DeviceArray within lax_numpy.py
-  def __neg__(self):
-    from jax.experimental.sparse import sparsify
-    return sparsify(jnp.negative)(self)
-
-  def __matmul__(self, other):
-    from jax.experimental.sparse import sparsify
-    return sparsify(jnp.matmul)(self, other)
-
-  def __rmatmul__(self, other):
-    from jax.experimental.sparse import sparsify
-    return sparsify(jnp.matmul)(other, self)
-
-  def __mul__(self, other):
-    from jax.experimental.sparse import sparsify
-    return sparsify(jnp.multiply)(self, other)
-
-  def __rmul__(self, other):
-    from jax.experimental.sparse import sparsify
-    return sparsify(jnp.multiply)(other, self)
-
-  def __add__(self, other):
-    from jax.experimental.sparse import sparsify
-    return sparsify(jnp.add)(self, other)
-
-  def __radd__(self, other):
-    from jax.experimental.sparse import sparsify
-    return sparsify(jnp.add)(other, self)
-
-  def sum(self, *args, **kwargs):
-    """Sum array along axis."""
-    from jax.experimental.sparse import sparsify
-    return sparsify(lambda x: x.sum(*args, **kwargs))(self)
 
 # vmappable handlers
 def _bcoo_to_elt(cont, _, val, axis):

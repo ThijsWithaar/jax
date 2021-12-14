@@ -188,6 +188,7 @@ from jax.experimental.sparse.ad import (
     value_and_grad as value_and_grad,
 )
 from jax.experimental.sparse.bcoo import (
+    bcoo_broadcast_in_dim as bcoo_broadcast_in_dim,
     bcoo_dot_general as bcoo_dot_general,
     bcoo_dot_general_p as bcoo_dot_general_p,
     bcoo_dot_general_sampled as bcoo_dot_general_sampled,
@@ -207,7 +208,17 @@ from jax.experimental.sparse.bcoo import (
     BCOO as BCOO,
 )
 
-from jax.experimental.sparse.ops import (
+from jax.experimental.sparse.api import (
+    empty as empty,
+    todense as todense,
+    todense_p as todense_p,
+)
+
+from jax.experimental.sparse.util import (
+    CuSparseEfficiencyWarning as CuSparseEfficiencyWarning,
+)
+
+from jax.experimental.sparse.coo import (
     coo_fromdense as coo_fromdense,
     coo_fromdense_p as coo_fromdense_p,
     coo_matmat as coo_matmat,
@@ -216,6 +227,10 @@ from jax.experimental.sparse.ops import (
     coo_matvec_p as coo_matvec_p,
     coo_todense as coo_todense,
     coo_todense_p as coo_todense_p,
+    COO as COO,
+)
+
+from jax.experimental.sparse.csr import (
     csr_fromdense as csr_fromdense,
     csr_fromdense_p as csr_fromdense_p,
     csr_matmat as csr_matmat,
@@ -224,10 +239,6 @@ from jax.experimental.sparse.ops import (
     csr_matvec_p as csr_matvec_p,
     csr_todense as csr_todense,
     csr_todense_p as csr_todense_p,
-    todense as todense,
-    todense_p as todense_p,
-    CuSparseEfficiencyWarning as CuSparseEfficiencyWarning,
-    COO as COO,
     CSC as CSC,
     CSR as CSR,
 )

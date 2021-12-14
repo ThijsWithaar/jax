@@ -55,7 +55,7 @@ import numpy as np
 from jax import core
 from jax import lax
 from jax import linear_util as lu
-from jax.experimental.sparse.bcoo import bcoo_multiply_dense
+from jax.experimental.sparse.bcoo import bcoo_multiply_dense, bcoo_multiply_sparse
 import jax.numpy as jnp
 from jax._src.api_util import flatten_fun_nokwargs
 from jax.interpreters import partial_eval as pe
@@ -63,6 +63,7 @@ from jax.interpreters import xla
 from jax.tree_util import tree_flatten, tree_map, tree_unflatten
 from jax.util import safe_map, safe_zip, split_list
 from jax._src.lax.control_flow import _check_tree_and_avals
+from jax._src.numpy import lax_numpy
 from jax._src.util import canonicalize_axis
 from jax.experimental import sparse
 from jax.experimental.sparse import BCOO
@@ -474,18 +475,24 @@ def _add_sparse(spenv, *argspecs):
 
 sparse_rules[lax.add_p] = _add_sparse
 
+def _sub_sparse(spenv, *argspecs):
+  lhs, rhs = argspecs
+  return _add_sparse(spenv, lhs, *sparse_rules[lax.neg_p](spenv, rhs))
+
+sparse_rules[lax.sub_p] = _sub_sparse
+
 def _mul_sparse(spenv, *argspecs):
   X, Y = argspecs
   if X.is_sparse() and Y.is_sparse():
-    if X.shape != Y.shape:
-      raise NotImplementedError("Multiplication between sparse matrices of different shapes.")
     if X.indices_ref == Y.indices_ref:
+      # TODO(jakevdp): this is inaccurate if there are duplicate indices
       out_data = lax.mul(X.data(spenv), Y.data(spenv))
       out_argspec = ArgSpec(X.shape, spenv.push(out_data), X.indices_ref)
-    elif X.indices(spenv).ndim != Y.indices(spenv).ndim or X.data(spenv).ndim != Y.data(spenv).ndim:
-      raise NotImplementedError("Multiplication between sparse matrices with different batch/dense dimensions.")
     else:
-      raise NotImplementedError("Multiplication between sparse matrices with different sparsity patterns.")
+      data, indices, shape = bcoo_multiply_sparse(X.data(spenv), X.indices(spenv),
+                                                  Y.data(spenv), Y.indices(spenv),
+                                                  lhs_shape=X.shape, rhs_shape=Y.shape)
+      out_argspec = ArgSpec(shape, spenv.push(data), spenv.push(indices))
   else:
     if Y.is_sparse():
       X, Y = Y, X
@@ -509,6 +516,14 @@ def _reduce_sum_sparse(spenv, *argspecs, axes):
 
 sparse_rules[lax.reduce_sum_p] = _reduce_sum_sparse
 
+def _broadcast_in_dim_sparse(spenv, *argspecs, shape, broadcast_dimensions):
+  operand, = argspecs
+  data, indices = sparse.bcoo_broadcast_in_dim(operand.data(spenv), operand.indices(spenv),
+                                               shape=operand.shape, new_shape=shape,
+                                               broadcast_dimensions=broadcast_dimensions)
+  return (ArgSpec(shape, spenv.push(data), spenv.push(indices)),)
+
+sparse_rules[lax.broadcast_in_dim_p] = _broadcast_in_dim_sparse
 
 def _squeeze_sparse(spenv, *argspecs, dimensions):
   arr, = argspecs
@@ -644,3 +659,44 @@ def _todense_sparse_rule(spenv, argspec, *, tree):
   return (out_argspec,)
 
 sparse_rules[sparse.todense_p] = _todense_sparse_rule
+
+
+#------------------------------------------------------------------------------
+# BCOO methods derived from sparsify
+# defined here to avoid circular imports
+
+def _sum(self, *args, **kwargs):
+  """Sum array along axis."""
+  return sparsify(lambda x: x.sum(*args, **kwargs))(self)
+
+def _sparse_rewriting_take(arr, idx, indices_are_sorted=False, unique_indices=False,
+                           mode=None, fill_value=None):
+  # mirrors lax_numpy._rewriting_take.
+  treedef, static_idx, dynamic_idx = lax_numpy._split_index_for_jit(idx, arr.shape)
+  result = sparsify(
+      lambda arr, idx: lax_numpy._gather(arr, treedef, static_idx, idx, indices_are_sorted,
+                                         unique_indices, mode, fill_value))(arr, dynamic_idx)
+  # Account for a corner case in the rewriting_take implementation.
+  if not isinstance(result, BCOO) and np.size(result) == 0:
+    result = BCOO.fromdense(result)
+  return result
+
+_swap_args = lambda f: lambda a, b: f(b, a)
+
+_bcoo_methods = {
+  'sum': _sum,
+  "__neg__": sparsify(jnp.negative),
+  "__pos__": sparsify(jnp.positive),
+  "__matmul__": sparsify(jnp.matmul),
+  "__rmatmul__": sparsify(_swap_args(jnp.matmul)),
+  "__mul__": sparsify(jnp.multiply),
+  "__rmul__": sparsify(_swap_args(jnp.multiply)),
+  "__add__": sparsify(jnp.add),
+  "__radd__": sparsify(_swap_args(jnp.add)),
+  "__sub__": sparsify(jnp.subtract),
+  "__rsub__": sparsify(_swap_args(jnp.subtract)),
+  "__getitem__": _sparse_rewriting_take,
+}
+
+for method, impl in _bcoo_methods.items():
+  setattr(BCOO, method, impl)

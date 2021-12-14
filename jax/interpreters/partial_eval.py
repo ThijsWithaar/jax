@@ -28,6 +28,7 @@ import numpy as np
 from jax import core
 from jax._src import dtypes
 from jax import linear_util as lu
+from jax._src import profiler
 from jax._src.ad_util import Zero
 from jax._src.api_util import flattened_fun_in_tree
 from jax._src.tree_util import PyTreeDef, tree_unflatten, tree_leaves
@@ -463,6 +464,7 @@ class JaxprTracer(Tracer):
     return self.pval.is_known()
 
 # TODO(necula): this could return a ClosedJaxpr with out_pvals
+@profiler.annotate_function
 def trace_to_jaxpr(fun: lu.WrappedFun, pvals: Sequence[PartialVal],
                    instantiate: Union[bool, Sequence[bool]] = False,
                    ) -> Tuple[Jaxpr, Tuple[PartialVal, ...], Tuple[core.Value, ...]]:
@@ -657,7 +659,7 @@ def tracers_to_jaxpr(
   return jaxpr, const_vals, env_vals
 
 @cache()
-def convert_constvars_jaxpr(jaxpr: Jaxpr):
+def convert_constvars_jaxpr(jaxpr: Jaxpr) -> Jaxpr:
   """Moves the constvars to the start of invars."""
   config.jax_enable_checks and core.check_jaxpr(jaxpr)
   lifted_jaxpr = Jaxpr(constvars=(),
@@ -666,7 +668,7 @@ def convert_constvars_jaxpr(jaxpr: Jaxpr):
   config.jax_enable_checks and core.check_jaxpr(lifted_jaxpr)
   return lifted_jaxpr
 
-def convert_envvars_to_constvars(jaxpr: Jaxpr, num_env_vars: int):
+def convert_envvars_to_constvars(jaxpr: Jaxpr, num_env_vars: int) -> Jaxpr:
   config.jax_enable_checks and core.check_jaxpr(jaxpr)
   env_vars, invars = split_list(jaxpr.invars, [num_env_vars])
   converted_jaxpr = Jaxpr(constvars=jaxpr.constvars + env_vars,
@@ -1521,6 +1523,7 @@ def arg_info_flattened(flat_pos: List[int]) -> str:
     return f"the argument passed at flattened position {flat_pos[0]}"
 
 
+@profiler.annotate_function
 def trace_to_jaxpr_dynamic(fun: lu.WrappedFun,
                            in_avals: Sequence[AbstractValue],
                            debug_info: Optional[DebugInfo] = None):
@@ -1552,6 +1555,7 @@ def extend_jaxpr_stack(main, frame):
     assert frame is main.jaxpr_stack[-1]
     main.jaxpr_stack = main.jaxpr_stack[:-1]
 
+@profiler.annotate_function
 def trace_to_jaxpr_final(fun: lu.WrappedFun,
                          in_avals: Sequence[AbstractValue],
                          debug_info: Optional[DebugInfo] = None):

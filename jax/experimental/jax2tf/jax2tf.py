@@ -24,13 +24,14 @@ from jax import lax
 from jax._src import ad_util
 from jax._src import api_util
 from jax import config
-from jax._src import api
 from jax import core, custom_derivatives
-from jax._src import dispatch
-from jax._src import dtypes
 from jax import linear_util as lu
 from jax import random, tree_util
 from jax import numpy as jnp
+from jax._src import ad_checkpoint
+from jax._src import api
+from jax._src import dispatch
+from jax._src import dtypes
 from jax._src.lax import control_flow as lax_control_flow
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import linalg as lax_linalg
@@ -169,7 +170,7 @@ class _ThreadLocalState(threading.local):
     # sharing for constants, to enable tf.Graph to take advantage of it.
     # See https://github.com/google/jax/issues/7992.
     self.constant_cache = None  # None means that we don't use a cache. We
-                                # may be outside a conversion scope.
+    # may be outside a conversion scope.
 
 
 _thread_local_state = _ThreadLocalState()
@@ -495,9 +496,9 @@ def _interpret_fun(
     fun = _interpret_subtrace(fun, main, in_avals)
     with _extended_name_stack(extra_name_stack):
       with core.new_sublevel():
-          out_vals: Sequence[Tuple[TfVal, core.ShapedArray]] = \
-              _call_wrapped_with_new_constant_cache(fun, in_vals,
-                                                    fresh_constant_cache=fresh_constant_cache)
+        out_vals: Sequence[Tuple[TfVal, core.ShapedArray]] = \
+            _call_wrapped_with_new_constant_cache(fun, in_vals,
+                                                  fresh_constant_cache=fresh_constant_cache)
 
       del main
 
@@ -856,7 +857,7 @@ class TensorFlowTrace(core.Trace):
     assert call_primitive.multiple_results
     vals: Sequence[TfVal] = [t.val for t in tracers]
     avals: Sequence[core.ShapedArray] = tuple(t.aval for t in tracers)
-    fun = _interpret_subtrace(fun, self.main, avals)
+    interpreted_fun = _interpret_subtrace(fun, self.main, avals)
     extra_name_stack = None
     if call_primitive == core.named_call_p:
       extra_name_stack = util.wrap_name(params["name"], "named")
@@ -867,9 +868,9 @@ class TensorFlowTrace(core.Trace):
         if call_primitive == core.named_call_p:
           with tf.name_scope(_sanitize_scope_name(params["name"])):
             vals_out: Sequence[Tuple[TfVal, core.ShapedArray]] = \
-                fun.call_wrapped(*vals)
+                interpreted_fun.call_wrapped(*vals)
         elif call_primitive == sharded_jit.sharded_call_p:
-          vals_out = _sharded_call(fun, vals, **params)
+          vals_out = _sharded_call(interpreted_fun, vals, **params)
         elif call_primitive == xla.xla_call_p:
           if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
             # Make a nested tf.function(jit_compile=True)
@@ -877,7 +878,7 @@ class TensorFlowTrace(core.Trace):
             def f_tf(*tf_args):
               nonlocal store_tf_res_avals
               tf_res_out: Sequence[Tuple[TfVal, core.ShapedArray]] = \
-                _call_wrapped_with_new_constant_cache(fun, tf_args,
+                _call_wrapped_with_new_constant_cache(interpreted_fun, tf_args,
                                                       fresh_constant_cache=False)
               tf_res_vals, tf_res_avals = util.unzip2(tf_res_out)
               store_tf_res_avals = tf_res_avals
@@ -885,9 +886,9 @@ class TensorFlowTrace(core.Trace):
             tf_vals_out = tf.function(f_tf, autograph=False, jit_compile=True)(*vals)
             vals_out = zip(tf_vals_out, store_tf_res_avals)
           else:
-            vals_out = fun.call_wrapped(*vals)
+            vals_out = interpreted_fun.call_wrapped(*vals)
         else:
-          vals_out = fun.call_wrapped(*vals)
+          vals_out = interpreted_fun.call_wrapped(*vals)
     return [TensorFlowTracer(self, v, a) for v, a in vals_out]
 
   def post_process_call(self, call_primitive: core.Primitive,
@@ -963,13 +964,11 @@ for unexpected in [core.call_p, core.named_call_p, xla.xla_call_p,
 
 # Primitives that are not yet implemented must be explicitly declared here.
 tf_not_yet_impl = [
-    "rng_uniform",
     "clz",
     "igamma_grad_a",
     "random_gamma_grad",
     "reduce_precision",
     "schur",
-    "remat2",  # TODO(mattjj,necula): support new remat?
     "name",
 
     # Not high priority?
@@ -1486,7 +1485,6 @@ def _conv_general_dilated(lhs, rhs, *,
   out_tf_shape = _aval_to_tf_shape(_out_aval)
   dnums_proto = _conv_general_dimension_numbers_proto(dimension_numbers)
   precision_config_proto = _precision_config_proto(precision)
-  assert batch_group_count == 1  # TODO(necula): implement batch_group_count
 
   def gen_conv(lhs, rhs, preferred_element_type: Optional[DType]):
     out = tfxla.conv(
@@ -1498,6 +1496,7 @@ def _conv_general_dilated(lhs, rhs, *,
         rhs_dilation,
         dnums_proto,
         feature_group_count=feature_group_count,
+        batch_group_count=batch_group_count,
         precision_config=precision_config_proto,
         preferred_element_type=preferred_element_type,
         use_v2=True)
@@ -2035,6 +2034,13 @@ def _rng_bit_generator(key: TfVal, *, shape, dtype, algorithm) -> Sequence[TfVal
 tf_impl[lax.rng_bit_generator_p] = _rng_bit_generator
 
 
+def _rng_uniform(minval: TfVal, maxval: TfVal, *, shape) -> TfVal:
+  shape_tf = _eval_shape(shape)
+  return tf.random.uniform(shape_tf, minval=minval, maxval=maxval, dtype=minval.dtype)
+
+tf_impl[lax.rng_uniform_p] = _rng_uniform
+
+
 def _gather_dimensions_proto(indices_shape, dimension_numbers):
   proto = xla_data_pb2.GatherDimensionNumbers()
   proto.offset_dims.extend(dimension_numbers.offset_dims)
@@ -2132,10 +2138,14 @@ def _scatter(operand, scatter_indices, updates, *, update_jaxpr, update_consts,
              dimension_numbers, indices_are_sorted, unique_indices, mode,
              _in_avals: Sequence[core.ShapedArray],
              _out_aval: core.ShapedArray):
-  del unique_indices, _in_avals
+  del unique_indices
 
   if mode == lax.GatherScatterMode.CLIP:
-    raise NotImplementedError("CLIP scatter mode not implemented in jax2tf")
+    clip_fn = _convert_jax_impl(lax_slicing._clamp_scatter_indices,
+                                multiple_results=False)
+    scatter_indices = clip_fn(
+        operand, scatter_indices, updates, dnums=dimension_numbers,
+        _in_avals=_in_avals, _out_aval=_in_avals[1])
 
   assert len(update_consts) == 0, "Update computation cannot have constants"
 
@@ -2270,6 +2280,12 @@ tf_impl_with_avals[lax.scan_p] = _convert_jax_impl(
     lax_control_flow._scan_impl,
     extra_name_stack="scan")
 
+tf_impl_with_avals[ad_checkpoint.remat_p] = \
+  _convert_jax_impl(partial(lax_control_flow._remat_translation_rule,
+                            # TODO: jax2tf cannot discriminate by platform
+                            platform="tpu"),
+                    multiple_results=True,
+                    extra_name_stack="checkpoint")
 
 def _top_k(operand: TfVal, k: int) -> Tuple[TfVal, TfVal]:
   # Some types originally incompatible with tf.math.top_k can be promoted

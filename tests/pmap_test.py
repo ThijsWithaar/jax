@@ -237,6 +237,16 @@ class PythonPmapTest(jtu.JaxTestCase):
     ans = f(x)
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+  def testGatherBool(self):
+    f = self.pmap(lambda x: lax.all_gather(x, 'i'), axis_name='i')
+
+    shape = (jax.device_count(), 4)
+    x = np.arange(prod(shape), dtype=np.float32).reshape(shape)
+    x = (x % 2).astype(np.bool_)
+    expected = np.array([x] * jax.device_count())
+    ans = f(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
   def testGatherTiled(self):
     f = self.pmap(lambda x: lax.all_gather(x, 'i', tiled=True), axis_name='i')
 
@@ -416,7 +426,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     self.assertRaisesRegex(
         ValueError,
         "pmap got inconsistent sizes for array axes to be mapped",
-        lambda: f(np.random.randn(n), np.random.randn(n - 1)))
+        lambda: f(self.rng().randn(n), self.rng().randn(n - 1)))
 
   @parameterized.named_parameters(
       {"testcase_name": "_mesh={}".format(device_mesh_shape).replace(" ", ""),
@@ -1205,7 +1215,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     device_count = jax.device_count()
     f0 = lambda x: x
     f1 = self.pmap(f0, axis_name='i')
-    ax = np.random.randn(2, device_count, 50, 60)
+    ax = self.rng().randn(2, device_count, 50, 60)
     bx = vmap(f1)(ax)
     self.assertAllClose(ax, bx, check_dtypes=False)
 
@@ -1256,7 +1266,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     device_count = jax.device_count()
     f0 = lambda x: x
     f1 = self.pmap(f0, axis_name='i')
-    ax = np.random.randn(device_count, 2, 50, 60)
+    ax = self.rng().randn(device_count, 2, 50, 60)
     bx = vmap(f1, in_axes=2, out_axes=2)(ax)
     self.assertAllClose(ax, bx, check_dtypes=False)
 
@@ -1265,10 +1275,10 @@ class PythonPmapTest(jtu.JaxTestCase):
     f0 = lambda *x: x
     f1 = self.pmap(f0, axis_name='i')
 
-    ax = np.random.randn(device_count, 2, 50, 60)
-    ay = np.random.randn(device_count, 30, 2)
-    az1 = np.random.randn(device_count, 20)
-    az2 = np.random.randn(2, device_count, 20)
+    ax = self.rng().randn(device_count, 2, 50, 60)
+    ay = self.rng().randn(device_count, 30, 2)
+    az1 = self.rng().randn(device_count, 20)
+    az2 = self.rng().randn(2, device_count, 20)
 
     bx, by, bz = vmap(f1, in_axes=(1, 2, (None, 0)), out_axes=(1, 2, 0))(ax, ay, (az1, az2))
 
@@ -1560,7 +1570,7 @@ class PythonPmapTest(jtu.JaxTestCase):
       return func(a).reshape(b.shape)
 
     n = nrep * 2
-    rng = np.random.RandomState(0)
+    rng = self.rng()
     a = rng.randn(n, n)
     b = rng.randn(n)
 
@@ -2135,7 +2145,7 @@ class PmapWithDevicesTest(jtu.JaxTestCase):
     f = lambda x: jnp.dot(x, x.T)
     f0 = pmap(f, devices=[d0])
     f1 = pmap(f, devices=[d1])
-    x = np.random.rand(1, 1000, 1000)
+    x = self.rng().rand(1, 1000, 1000)
     r0 = f0(x)
     r1 = f1(x)
     expected = np.expand_dims(np.dot(x.squeeze(), x.squeeze().T), 0)
@@ -2194,6 +2204,23 @@ class PmapWithDevicesTest(jtu.JaxTestCase):
     x = jnp.ones((jax.device_count() // 2, 2))
     ans = foo(x)
     expected = x * 2
+    self.assertAllClose(ans, expected)
+
+  def testNestedPmapsBools(self):
+    if jax.device_count() % 2 != 0:
+      raise SkipTest
+
+    # Devices specified in outer pmap are OK
+    @partial(pmap, axis_name='i', devices=jax.devices())
+    def foo(x):
+      @partial(pmap, axis_name='j')
+      def bar(y):
+        return jnp.logical_not(y)
+      return bar(x)
+
+    x = jnp.ones((jax.device_count() // 2, 2), jnp.bool_)
+    ans = foo(x)
+    expected = jnp.zeros((jax.device_count() // 2, 2), jnp.bool_)
     self.assertAllClose(ans, expected)
 
   def testNestedPmapsError(self):

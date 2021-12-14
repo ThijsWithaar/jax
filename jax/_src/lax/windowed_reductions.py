@@ -349,7 +349,8 @@ def _reduce_window_sum_translation_rule(ctx, avals_in, avals_out, operand, *,
   return [xops.ReduceWindowWithGeneralPadding(
     operand,
     xla.pyval_to_ir_constant(ctx.builder, np.array(0, operand_aval.dtype)),
-    xla.primitive_subcomputation(ctx.platform, lax.add_p, scalar, scalar),
+    xla.primitive_subcomputation(ctx.platform, ctx.axis_env, lax.add_p, scalar,
+                                 scalar),
       window_dimensions,
     window_strides, base_dilation, window_dilation, padding)]
 
@@ -405,7 +406,8 @@ def _reduce_window_chooser_translation_rule(
   return [xops.ReduceWindowWithGeneralPadding(
     operand,
     xla.pyval_to_ir_constant(ctx.builder, identity(operand_aval.dtype)),
-    xla.primitive_subcomputation(ctx.platform, prim, scalar, scalar),
+    xla.primitive_subcomputation(ctx.platform, ctx.axis_env, prim, scalar,
+                                 scalar),
       window_dimensions,
     window_strides, base_dilation, window_dilation, padding)]
 
@@ -508,9 +510,9 @@ def _reduce_window_lower(
 mlir.register_lowering(reduce_window_sum_p, partial(
     _reduce_window_lower, mhlo.AddOp, lambda _: 0))
 mlir.register_lowering(reduce_window_min_p, partial(
-    _reduce_window_lower, mhlo.MinOp, lax._get_min_identity))
+    _reduce_window_lower, mlir.min_mhlo, lax._get_min_identity))
 mlir.register_lowering(reduce_window_max_p, partial(
-    _reduce_window_lower, mhlo.MaxOp, lax._get_max_identity))
+    _reduce_window_lower, mlir.max_mhlo, lax._get_max_identity))
 
 
 
@@ -582,10 +584,10 @@ def _select_and_scatter_add_translation(
   dtype = operand_aval.dtype
   scalar = ShapedArray((), dtype)
   select = xla.primitive_subcomputation(
-      ctx.platform, select_prim, scalar, scalar)
+      ctx.platform, ctx.axis_env, select_prim, scalar, scalar)
   scatter = xla.primitive_subcomputation(
-      ctx.platform, lax.or_p if dtype == np.bool_ else lax.add_p, scalar,
-      scalar)
+      ctx.platform, ctx.axis_env, lax.or_p if dtype == np.bool_ else lax.add_p,
+      scalar, scalar)
   zero = xla.pyval_to_ir_constant(c, np.array(0, dtype))
   # TODO(b/161704903): remove this workaround when XLA:CPU bug is fixed.
   expand_padding = (expand_padding and
@@ -804,9 +806,9 @@ def _select_and_gather_add_translation(
 
   def reducer():
     c = xc.XlaBuilder("select_and_gather_pair_reducer")
-    x = xb.parameter(c, 0,
+    x = xla.parameter(c, 0,
       xla_client.Shape.array_shape(np.dtype(double_word_dtype), ()))
-    y = xb.parameter(c, 1,
+    y = xla.parameter(c, 1,
       xla_client.Shape.array_shape(np.dtype(double_word_dtype), ()))
     assert select_prim is lax.ge_p or select_prim is lax.le_p
     which = xops.Ge if select_prim is lax.ge_p else xops.Le

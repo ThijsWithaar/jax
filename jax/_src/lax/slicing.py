@@ -1240,7 +1240,8 @@ def _gather_batching_rule(batched_args, batch_dims, *, dimension_numbers,
     if core.symbolic_equal_dim(operand.shape[0], 0):
       output_shape = _gather_shape_rule(
           core.ShapedArray(operand.shape[1:], operand.dtype),
-          core.ShapedArray(indices.shape[1:], indices.dtype),
+          core.ShapedArray(indices.shape[1:],
+                           dtypes.canonicalize_dtype(indices.dtype)),
           dimension_numbers=dimension_numbers, slice_sizes=slice_sizes,
           unique_indices=unique_indices, indices_are_sorted=indices_are_sorted,
           mode=mode, fill_value=fill_value)
@@ -1430,10 +1431,6 @@ def _scatter_shape_rule(operand, indices, updates, *, update_jaxpr,
 
 def _clamp_scatter_indices(operand, indices, updates, *, dnums):
   """Clamps `indices` to be in-range for a scatter."""
-  intarray = partial(np.array, dtype=np.int64)
-  operand_dims = intarray(operand.shape)
-  upper_bound = operand_dims[intarray(dnums.scatter_dims_to_operand_dims)]
-
   slice_sizes = []
   pos = 0
   for i in range(len(operand.shape)):
@@ -1443,7 +1440,9 @@ def _clamp_scatter_indices(operand, indices, updates, *, dnums):
       slice_sizes.append(updates.shape[dnums.update_window_dims[pos]])
       pos += 1
 
-  upper_bound -= intarray(slice_sizes)[intarray(dnums.scatter_dims_to_operand_dims)]
+  upper_bound = np.array([operand.shape[i] - slice_sizes[i]
+                          for i in dnums.scatter_dims_to_operand_dims],
+                         np.int64)
   upper_bound = np.minimum(upper_bound, np.iinfo(indices.dtype).max)
   upper_bound = lax.broadcast_in_dim(upper_bound, indices.shape,
                                      (len(indices.shape) - 1,))
@@ -1458,8 +1457,8 @@ def _scatter_translation_rule(ctx, avals_in, avals_out, operand, indices,
   if mode == GatherScatterMode.CLIP:
     clip_fn = xla.lower_fun(_clamp_scatter_indices, multiple_results=False,
                             new_style=True)
-    indices, = clip_fn(ctx, avals_in, [indices_aval.update(dtype=np.int64)],
-                       operand, indices, updates, dnums=dimension_numbers)
+    indices, = clip_fn(ctx, avals_in, None, operand, indices, updates,
+                       dnums=dimension_numbers)
 
   c = ctx.builder
 
@@ -1479,8 +1478,8 @@ def _scatter_add_translation_rule(
   if mode == GatherScatterMode.CLIP:
     clip_fn = xla.lower_fun(_clamp_scatter_indices, multiple_results=False,
                             new_style=True)
-    indices, = clip_fn(ctx, avals_in, [indices_aval.update(dtype=np.int64)],
-                       operand, indices, updates, dnums=dimension_numbers)
+    indices, = clip_fn(ctx, avals_in, None, operand, indices, updates,
+                       dnums=dimension_numbers)
 
   dtype = operand_aval.dtype
   scatter_dims = _scatter_dimensions_proto(
@@ -1489,7 +1488,7 @@ def _scatter_add_translation_rule(
   def _make_reducer(dtype):
     subc = xc.XlaBuilder("scatter_add_reducer")
     shape = xc.Shape.array_shape(np.dtype(dtype), ())
-    args = [xb.parameter(subc, 0, shape), xb.parameter(subc, 1, shape)]
+    args = [xla.parameter(subc, 0, shape), xla.parameter(subc, 1, shape)]
     out = xops.Add(args[0], args[1])
     return subc.build(out)
 
@@ -1986,15 +1985,20 @@ def _real_dtype(dtype): return np.finfo(dtype).dtype
 def _scatter_add_lower_gpu(ctx, avals_in, avals_out, operand, indices, updates,
                            *, update_jaxpr, update_consts, dimension_numbers,
                            indices_are_sorted, unique_indices, mode):
-  if operand.dtype != np.complex128:
+  operand_aval_in, _, updates_aval_in = avals_in
+  if operand_aval_in.dtype != np.complex128:
     return _scatter_lower(ctx, avals_in, avals_out, operand, indices, updates,
                           update_jaxpr=update_jaxpr,
                           update_consts=update_consts,
                           dimension_numbers=dimension_numbers,
                           indices_are_sorted=indices_are_sorted,
                           unique_indices=unique_indices, mode=mode)
-  assert mode == GatherScatterMode.PROMISE_IN_BOUNDS, mode
-  _, _, updates_aval_in = avals_in
+
+  if mode == GatherScatterMode.CLIP:
+    clip_fn = mlir.lower_fun(_clamp_scatter_indices, multiple_results=False)
+    (indices,), = clip_fn(ctx, avals_in, None, operand, indices, updates,
+                          dnums=dimension_numbers)
+
   aval_out, = avals_out
   dnums = dimension_numbers
   scatter_dnums = mhlo.ScatterDimensionNumbers.get(
@@ -2005,8 +2009,6 @@ def _scatter_add_lower_gpu(ctx, avals_in, avals_out, operand, indices, updates,
   real_dtype = _real_dtype(aval_out.dtype)
   operand_type_part = mlir.aval_to_ir_type(
       core.ShapedArray(aval_out.shape, real_dtype))
-  updates_type_part = mlir.aval_to_ir_type(
-      core.ShapedArray(updates_aval_in.shape, real_dtype))
 
   def _scatter(operand_part, updates_part):
     scatter = mhlo.ScatterOp(operand_type_part, operand_part, indices,
@@ -2016,15 +2018,13 @@ def _scatter_add_lower_gpu(ctx, avals_in, avals_out, operand, indices, updates,
     scalar_type = mlir.aval_to_ir_type(core.ShapedArray((), real_dtype))
     reducer = scatter.regions[0].blocks.append(scalar_type, scalar_type)
     with ir.InsertionPoint(reducer):
-      add = mhlo.AddOp(scalar_type, *reducer.arguments).result
+      add = mhlo.AddOp(*reducer.arguments).result
       mhlo.ReturnOp([add])
     return scatter.result
 
-  real = _scatter(mhlo.RealOp(operand_type_part, operand).result,
-                  mhlo.RealOp(updates_type_part, updates).result)
-  imag = _scatter(mhlo.ImagOp(operand_type_part, operand).result,
-                  mhlo.ImagOp(updates_type_part, updates).result)
-  return mhlo.ComplexOp(mlir.aval_to_ir_type(aval_out), real, imag).results
+  real = _scatter(mhlo.RealOp(operand).result, mhlo.RealOp(updates).result)
+  imag = _scatter(mhlo.ImagOp(operand).result, mhlo.ImagOp(updates).result)
+  return mhlo.ComplexOp(real, imag).results
 
 mlir.register_lowering(scatter_add_p, _scatter_add_lower_gpu, platform="gpu")
 

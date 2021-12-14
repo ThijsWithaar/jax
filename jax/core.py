@@ -793,6 +793,8 @@ def maybe_find_leaked_tracers(x: Optional[Union[MainTrace, Sublevel]]):
   """
   if not getattr(threading.current_thread(), 'pydev_do_not_trace', True):
     warnings.warn(TRACER_LEAK_DEBUGGER_WARNING)
+  # Trigger garbage collection to filter out cyclical dependency false positives
+  gc.collect()
   traces = list(filter(lambda x: isinstance(x, Trace), gc.get_referrers(x)))
   tracers = list(filter(lambda x: isinstance(x, Tracer), gc.get_referrers(*traces)))
   return tracers
@@ -1039,7 +1041,7 @@ class UnshapedArray(AbstractValue):
   array_abstraction_level = 2
 
   def __init__(self, dtype, weak_type=False):
-    self.dtype = np.dtype(dtypes.canonicalize_dtype(dtype))
+    self.dtype = np.dtype(dtype)
     self.weak_type = weak_type
 
   def update(self, dtype=None, weak_type=None):
@@ -1181,19 +1183,20 @@ class ConcreteArray(ShapedArray):
   __slots__ = ['val']
   array_abstraction_level = 0
 
-  def __init__(self, val, weak_type=None):
-    super().__init__(np.shape(val), np.result_type(val),
-                     weak_type=dtypes.is_weakly_typed(val) if weak_type is None else weak_type)
+  def __init__(self, dtype, val, weak_type=None):
+    super().__init__(
+        np.shape(val), dtype,
+        weak_type=dtypes.is_weakly_typed(val) if weak_type is None else weak_type)
     # Note: canonicalized self.dtype doesn't necessarily match self.val
+    assert self.dtype == dtypes.canonicalize_dtype(np.result_type(val)), (val, dtype)
     self.val = val
     assert self.dtype != np.dtype('O'), val
 
-  def update(self, val=None, weak_type=None):
-    if val is None:
-      val = self.val
-    if weak_type is None:
-      weak_type = self.weak_type
-    return ConcreteArray(val, weak_type)
+  def update(self, dtype=None, val=None, weak_type=None):
+    dtype = self.dtype if dtype is None else dtype
+    val = self.val if val is None else val
+    weak_type = self.weak_type if weak_type is None else weak_type
+    return ConcreteArray(dtype, val, weak_type)
 
   def __eq__(self, other):
     if (type(self) is type(other) and self.dtype == other.dtype
@@ -1269,7 +1272,8 @@ raise_to_shaped_mappings : Dict[type, Callable] = {
   Bot: lambda aval, _: aval,
   UnshapedArray: lambda aval, _: aval,
   ShapedArray: lambda aval, weak_type: ShapedArray(
-      aval.shape, aval.dtype, weak_type, aval.named_shape)
+      aval.shape, dtypes.canonicalize_dtype(aval.dtype), weak_type,
+      aval.named_shape)
 }
 
 ### Operations on shapes and dimension sizes.
@@ -1629,9 +1633,9 @@ def call_bind(primitive: Union['CallPrimitive', 'MapPrimitive'],
   out_axes_transforms = _IgnoreElemList()
   if primitive.map_primitive:
     out_axes_thunk = params['out_axes_thunk']
-    # The new thunk depends deterministically on the old thunk and the wrapped function.
-    # Any caching already has to include the wrapped function as part of the key, so we
-    # only use the previous thunk for equality checks.
+    # The new thunk depends deterministically on the old thunk and the wrapped
+    # function. Any caching already has to include the wrapped function as part
+    # of the key, so we only use the previous thunk for equality checks.
     @as_hashable_function(closure=out_axes_thunk)
     def new_out_axes_thunk():
       out_axes = out_axes_thunk()

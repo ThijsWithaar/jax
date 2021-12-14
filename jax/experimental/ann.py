@@ -63,7 +63,6 @@ from typing import (Any, Tuple)
 
 import numpy as np
 from jax import lax, core
-from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
 from jax._src import ad_util, dtypes
 
@@ -167,10 +166,10 @@ def _approx_top_k_abstract_eval(operand, *, k, reduction_dimension,
 def _comparator_builder(operand, op_type, is_max_k):
   c = xc.XlaBuilder(
       'top_k_{}_comparator'.format('gt' if is_max_k else 'lt'))
-  p0 = xb.parameter(c, 0, xc.Shape.scalar_shape(op_type))
-  p1 = xb.parameter(c, 1, xc.Shape.scalar_shape(op_type))
-  xb.parameter(c, 2, xc.Shape.scalar_shape(np.dtype(np.int32)))
-  xb.parameter(c, 3, xc.Shape.scalar_shape(np.dtype(np.int32)))
+  p0 = xla.parameter(c, 0, xc.Shape.scalar_shape(op_type))
+  p1 = xla.parameter(c, 1, xc.Shape.scalar_shape(op_type))
+  xla.parameter(c, 2, xc.Shape.scalar_shape(np.dtype(np.int32)))
+  xla.parameter(c, 3, xc.Shape.scalar_shape(np.dtype(np.int32)))
   if is_max_k:
     cmp_result = xc.ops.Gt(p0, p1)
   else:
@@ -178,9 +177,10 @@ def _comparator_builder(operand, op_type, is_max_k):
   return c.build(cmp_result)
 
 
-def _approx_top_k_tpu_translation(c, operand, k, reduction_dimension,
-                                  recall_target, is_max_k,
+def _approx_top_k_tpu_translation(ctx, avals_in, avals_out, operand, *, k,
+                                  reduction_dimension, recall_target, is_max_k,
                                   reduction_input_size_override):
+  c = ctx.builder
   op_shape = c.get_shape(operand)
   if not op_shape.is_array():
     raise ValueError('operand must be an array, but was {}'.format(op_shape))
@@ -203,14 +203,17 @@ def _approx_top_k_tpu_translation(c, operand, k, reduction_dimension,
                      reduction_dimension)
   init_val = xc.ops.Constant(c, init_literal)
   init_arg = xc.ops.Constant(c, np.int32(-1))
-  return xc.ops.ApproxTopK(c, [operand, iota], [init_val, init_arg], k,
-                           reduction_dimension, comparator, recall_target, True,
-                           reduction_input_size_override)
+  out = xc.ops.ApproxTopK(c, [operand, iota], [init_val, init_arg], k,
+                          reduction_dimension, comparator, recall_target, True,
+                          reduction_input_size_override)
+  return xla.xla_destructure(c, out)
 
 
-def _approx_top_k_fallback_translation(c, operand, k, reduction_dimension,
+def _approx_top_k_fallback_translation(ctx, avals_in, avals_out, operand, *, k,
+                                       reduction_dimension,
                                        recall_target, is_max_k,
                                        reduction_input_size_override):
+  c = ctx.builder
   op_shape = c.get_shape(operand)
   if not op_shape.is_array():
     raise ValueError('operand must be an array, but was {}'.format(op_shape))
@@ -226,7 +229,7 @@ def _approx_top_k_fallback_translation(c, operand, k, reduction_dimension,
   args = xc.ops.GetTupleElement(val_arg, 1)
   sliced_vals = xc.ops.SliceInDim(vals, 0, k, 1, reduction_dimension)
   sliced_args = xc.ops.SliceInDim(args, 0, k, 1, reduction_dimension)
-  return xc.ops.Tuple(c, [sliced_vals, sliced_args])
+  return sliced_vals, sliced_args
 
 
 def _approx_top_k_batch_rule(batched_args, batch_dims, *, k,
@@ -292,11 +295,8 @@ approx_top_k_p = core.Primitive('approx_top_k')
 approx_top_k_p.multiple_results = True
 approx_top_k_p.def_impl(partial(xla.apply_primitive, approx_top_k_p))
 approx_top_k_p.def_abstract_eval(_approx_top_k_abstract_eval)
-xla.backend_specific_translations['tpu'][
-    approx_top_k_p] = _approx_top_k_tpu_translation
-xla.backend_specific_translations['cpu'][
-    approx_top_k_p] = _approx_top_k_fallback_translation
-xla.backend_specific_translations['gpu'][
-    approx_top_k_p] = _approx_top_k_fallback_translation
+xla.register_translation(approx_top_k_p, _approx_top_k_fallback_translation)
+xla.register_translation(approx_top_k_p, _approx_top_k_tpu_translation,
+                         platform='tpu')
 batching.primitive_batchers[approx_top_k_p] = _approx_top_k_batch_rule
 ad.primitive_jvps[approx_top_k_p] = _approx_top_k_jvp

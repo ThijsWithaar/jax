@@ -16,14 +16,13 @@ import hashlib
 import os
 import re
 import sys
-from typing import List
+from typing import List, Optional
 
 import jax
 from jax.experimental.compilation_cache.file_system_cache import FileSystemCache
 import jax._src.lib
 from jax._src.lib import xla_client
 from absl import logging
-from typing import Optional
 
 _cache = None
 
@@ -44,19 +43,18 @@ def get_executable(xla_computation, compile_options, backend) -> Optional[xla_cl
   xla_executable_serialized = _cache.get(cache_key)
   if not xla_executable_serialized:
     return None
-  # TODO(skye): xla_computation.get_hlo_module() is the unoptimized HLO but it should
-  #be optimized
   xla_executable_deserialized = backend.deserialize_executable(
       xla_executable_serialized,
-      xla_computation.get_hlo_module(),
       compile_options)
   return xla_executable_deserialized
 
-def put_executable(xla_computation, compile_options, executable: xla_client.Executable,
-                   backend):
+def put_executable(module_name, xla_computation, compile_options,
+                   executable: xla_client.Executable, backend):
   """Adds 'executable' to the cache, possibly evicting older entries."""
   assert _cache is not None, "initialize_cache must be called before you can call put_executable()"
   cache_key = get_cache_key(xla_computation, compile_options, backend)
+  logging.info('Writing %s to persistent compilation cache with key %s.',
+               module_name, cache_key)
   serialized_executable = backend.serialize_executable(executable)
   _cache.put(cache_key, serialized_executable)
 
@@ -84,7 +82,10 @@ def get_cache_key(xla_computation, compile_options, backend) -> str:
   #   num_consts=0 ]"
   # TODO(skye): in theory this could cause us to scrub meaningful binary proto
   # data. Do something more robust.
-  serialized_hlo = xla_computation.as_serialized_hlo_module_proto()
+  if isinstance(xla_computation, str):
+    serialized_hlo = xla_computation.encode()  # MLIR module
+  else:
+    serialized_hlo = xla_computation.as_serialized_hlo_module_proto()
   scrubbed_hlo = re.sub(b" at 0x[a-f0-9]+>", b" at 0x...>", serialized_hlo)
   hash_obj.update(scrubbed_hlo)
   _log_cache_key_hash(hash_obj, "computation")
