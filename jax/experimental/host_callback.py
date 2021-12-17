@@ -313,6 +313,20 @@ its argument::
     # what: x,x^2 : (3., 9.)
     # what: cotangents : (9., 3.)
 
+If you use :func:`ad_checkpoint.checkpoint` to rematerialize the residuals
+for the backward pass, then the callbacks from the primal computation will
+be called twice::
+
+    jax.grad(lambda x: power3(ad_checkpoint.checkpoint(power3)(x)))(3.)
+    # what: x,x^2 : (3., 9.)
+    # what: x,x^2 : (27., 729.)
+    # what: x,x^2 : (3., 9.)
+
+The callbacks are, in order from: the primal computation of the inner ``power3``,
+the primal computation of the outer ``power3``, and the rematerialization
+of the residuals for the inner ``power3``.
+
+
 Behavior under jax.vmap
 -----------------------
 
@@ -393,7 +407,10 @@ in one of the tap functions. This exception will include the text and the
 stack trace of the last exception encountered.
 
 One further complication arises for callback functions that must return
-results to the call origin device. In order to avoid the device computation
+results to the call origin device, such as :func:`call()`. This is handled
+differently on CPU/GPU devices compared to TPU devices.
+
+On CPU/GPU devices, in order to avoid the device computation
 being stuck waiting for a result that will never arrive, in case of any
 error during the processing of the callback (whether raised by the user-code
 itself or due to a mismatch of the returned value and the expected return_shape)
@@ -415,8 +432,10 @@ RET_CHECK failure ... Mismatch between infeed source buffer shape s8[12345] ...
 
 To debug the underlying cause for these messages, see the Debugging section.
 
-On TPU, there is currently no shape check for infeed, so we take the safer
-route to not send anything in case of errors, and let the computation hang.
+On TPU devices, there is currently no shape check for infeed, so we take the
+safer route of not sending this fake result in case of errors. This means
+that the computation will hang, and no exception will be raised (but any
+exceptions in the callback functions will still appear in the logs).
 
 The current implementation uses the outfeed mechanism provided by XLA. The
 mechanism itself is quite primitive in the sense that a receiver must know
@@ -900,7 +919,7 @@ It takes the following parameters:
 """
 outside_call_p = core.Primitive("outside_call")
 outside_call_p.multiple_results = True
-dispatch.outfeed_primitives.add(outside_call_p)
+core.outfeed_primitives.add(outside_call_p)
 
 
 def _outside_call_abstract_eval(*args_a: pe.AbstractValue,
@@ -1385,7 +1404,7 @@ def _rewrite_jaxpr(jaxpr: core.Jaxpr, has_input_token: bool,
   """Rewrite a Jaxpr to thread the token, if needed."""
   assert has_input_token or not has_output_token
 
-  if not has_input_token and not dispatch.jaxpr_uses_outfeed(jaxpr):
+  if not has_input_token and not core.jaxpr_uses_outfeed(jaxpr):
     return jaxpr
 
   mk_new_var = core.gensym([jaxpr])
@@ -1407,7 +1426,7 @@ def _rewrite_jaxpr(jaxpr: core.Jaxpr, has_input_token: bool,
                            lax.create_token_p, {}, source_info_util.current()))
 
   for eqn in jaxpr.eqns:
-    if not dispatch.primitive_uses_outfeed(eqn.primitive, eqn.params):
+    if not core.primitive_uses_outfeed(eqn.primitive, eqn.params):
       eqns.append(eqn)
     else:
       output_token_var = mk_new_var(last_token_var.aval)
@@ -1445,7 +1464,7 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
     cond_jaxpr, _, body_jaxpr, _ = util.split_dict(
         eqn.params,
         ["cond_jaxpr", "cond_nconsts", "body_jaxpr", "body_nconsts"])
-    if dispatch.jaxpr_uses_outfeed(cond_jaxpr.jaxpr):
+    if core.jaxpr_uses_outfeed(cond_jaxpr.jaxpr):
       _rewrite_while_outfeed_cond(eqn, eqns, input_token_var, output_token_var,
                                   input_itoken_var, output_itoken_var,
                                   mk_new_var)

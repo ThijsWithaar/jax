@@ -14,14 +14,28 @@ PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
 
 * Breaking changes:
   * The host_callback primitives have been simplified to drop the
-  special autodiff handling for hcb.id_tap and id_print.
-  From now on, only the primals are tapped. The old behavior can be
-  obtained (for a limited time) by setting the ``JAX_HOST_CALLBACK_AD_TRANSFORMS``
-  environment variable, or the ```--flax_host_callback_ad_transforms``` flag.
-  Additionally, added documentation for how to implement the old behavior
-  using JAX custom AD APIs ({jax-issue}`#7839`).
+    special autodiff handling for hcb.id_tap and id_print.
+    From now on, only the primals are tapped. The old behavior can be
+    obtained (for a limited time) by setting the ``JAX_HOST_CALLBACK_AD_TRANSFORMS``
+    environment variable, or the ```--flax_host_callback_ad_transforms``` flag.
+    Additionally, added documentation for how to implement the old behavior
+    using JAX custom AD APIs ({jax-issue}`#8678`).
+
+* Bug fixes:
+  * host_callback now supports ad_checkpoint.checkpoint ({jax-issue}`#8907`).
+
+* New features:
+  * add `jax.block_until_ready` ({jax-issue}`#8941)
+  * Added a new debugging flag/environment variable `JAX_DUMP_IR_TO=/path`.
+    If set, JAX dumps the MHLO/HLO IR it generates for each computation to a
+    file under the given path.
 
 ## jaxlib 0.1.76 (Unreleased)
+* New features
+  * Includes precompiled SASS for NVidia compute capability 8.0 GPUS
+    (e.g. A100). Removes precompiled SASS for compute capability 6.1 so as not
+    to increase the number of compute capabilities: GPUs with compute capability
+    6.1 can use the 6.0 SASS.
 
 ## jaxlib 0.1.75 (Dec 8, 2021)
 * New features:

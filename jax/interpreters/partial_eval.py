@@ -1029,7 +1029,7 @@ def dce_jaxpr(jaxpr: Jaxpr, used_outputs: List[bool]
     used_outs = map(read, eqn.outvars)
     # If any outputs are used, then we need to keep a version of the eqn and
     # potentially mark some inputs as used. Otherwise mark all inputs as unused.
-    if any(used_outs):
+    if any(used_outs) or core.primitive_uses_outfeed(eqn.primitive, eqn.params):
       # If there's a rule for modifying the eqn and computing used inputs, apply
       # it. Otherwise, keep the eqn unmodified and mark all inputs as used.
       rule = dce_rules.get(eqn.primitive)
@@ -1408,8 +1408,9 @@ class DynamicJaxprTrace(core.Trace):
     with core.new_sublevel():
       fun_jaxpr, out_avals, consts = trace_to_subjaxpr_dynamic(fun, self.main, in_avals)
     closed_fun_jaxpr = core.ClosedJaxpr(convert_constvars_jaxpr(fun_jaxpr), ())
+    main_ = ref(self.main)
     jvp_jaxpr_thunk = _memoize(
-        lambda: trace_to_subjaxpr_dynamic(jvp, self.main, 2 * in_avals)[::2])
+        lambda: trace_to_subjaxpr_dynamic(jvp, main_(), 2 * in_avals)[::2])
     out_tracers = [DynamicJaxprTracer(self, a) for a in out_avals]
     invars = map(self.getvar, tracers)
     constvars = map(self.getvar, map(self.instantiate_const, consts))
@@ -1430,8 +1431,9 @@ class DynamicJaxprTrace(core.Trace):
     with core.new_sublevel():
       fun_jaxpr, out_avals, consts = trace_to_subjaxpr_dynamic(fun, self.main, in_avals)
     closed_fun_jaxpr = core.ClosedJaxpr(convert_constvars_jaxpr(fun_jaxpr), ())
+    main_ = ref(self.main)
     fwd_jaxpr_thunk = _memoize(
-        lambda: trace_to_subjaxpr_dynamic(fwd, self.main, in_avals)[::2])
+        lambda: trace_to_subjaxpr_dynamic(fwd, main_(), in_avals)[::2])
     out_tracers = [DynamicJaxprTracer(self, a) for a in out_avals]
     invars = map(self.getvar, tracers)
     constvars = map(self.getvar, map(self.instantiate_const, consts))
@@ -1449,6 +1451,9 @@ class DynamicJaxprTrace(core.Trace):
     assert False  # unreachable
 
 def _memoize(thunk):
+  if config.jax_check_tracer_leaks:
+    return thunk
+
   cell = []
   saved_state = core.thread_local_state.trace_state.copy()
   def memoized():

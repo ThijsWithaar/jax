@@ -411,6 +411,13 @@ class CPPJitTest(jtu.BufferDonationTestCase):
         TypeError, ".* 'foo' of type <.*'str'> is not a valid JAX type",
         lambda: self.jit(f)("foo"))
 
+    if jax._src.lib._xla_extension_version >= 47:
+      # Jax type objects aren't valid data arguments.
+      self.assertRaisesRegex(
+          TypeError,
+          ".* '.*int32.*' of type <.*_ScalarMeta.*> is not a valid JAX type",
+          lambda: self.jit(f)(jnp.int32))
+
   def test_jit_on_all_devices(self):
     # Verifies we can run the same computation on every device present, even
     # if they are, for example, different models of GPU.
@@ -817,6 +824,23 @@ class PythonJitTest(CPPJitTest):
 
 
 class APITest(jtu.JaxTestCase):
+
+  def test_grad_item(self):
+    def f(x):
+      if x.astype(bool).item():
+        return x ** 2
+      else:
+        return x
+    out = jax.grad(f)(2.0)
+    self.assertEqual(out, 4)
+
+  def test_jit_item(self):
+    def f(x):
+      return x.item()
+    x = jnp.array(1.0)
+    self.assertEqual(f(x), x)
+    with self.assertRaisesRegex(core.ConcretizationTypeError, "Abstract tracer value"):
+      jax.jit(f)(x)
 
   def test_grad_bad_input(self):
     def f(x):
@@ -1516,6 +1540,13 @@ class APITest(jtu.JaxTestCase):
     y = x.block_until_ready()
     # Tests mostly that block_until_ready() does not produce an error.
     self.assertTrue(y is x)
+
+  def test_block_until_ready_function(self):
+    # Just tests that we don't error...
+    pytree = (device_put(1.), np.ones(3))
+    pytree = jax.block_until_ready(pytree)
+    self.assertAllClose(pytree[0], jnp.array(1.), check_dtypes=False)
+    self.assertAllClose(pytree[1], np.ones(3), check_dtypes=False)
 
   def test_devicearray_weakref_friendly(self):
     x = device_put(1.)

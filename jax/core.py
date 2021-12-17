@@ -973,7 +973,7 @@ def check_valid_jaxtype(x):
 
 
 def concrete_aval(x):
-  for typ in type(x).mro():
+  for typ in type(x).__mro__:
     handler = pytype_aval_mappings.get(typ)
     if handler: return handler(x)
   if hasattr(x, '__jax_array__'):
@@ -1261,7 +1261,7 @@ pytype_aval_mappings[Token] = lambda _: abstract_token
 def raise_to_shaped(aval: AbstractValue, weak_type=None):
   if weak_type is None:
     weak_type = getattr(aval, 'weak_type', False)
-  for typ in type(aval).mro():
+  for typ in type(aval).__mro__:
     handler = raise_to_shaped_mappings.get(typ)
     if handler: return handler(aval, weak_type)
   raise TypeError(type(aval))
@@ -1677,6 +1677,32 @@ call_p.def_impl(call_impl)
 
 named_call_p: CallPrimitive = CallPrimitive('named_call')
 named_call_p.def_impl(call_impl)
+
+outfeed_primitives: Set[Primitive] = set()
+def jaxpr_uses_outfeed(jaxpr: Jaxpr) -> bool:
+  """Finds if there are outfeed primitives anywhere inside a Jaxpr."""
+  return any(primitive_uses_outfeed(eqn.primitive, eqn.params)
+             for eqn in jaxpr.eqns)
+
+def _param_uses_outfeed(param):
+  if type(param) is Jaxpr:
+    if jaxpr_uses_outfeed(param):
+      return True
+  elif type(param) is ClosedJaxpr:
+    if jaxpr_uses_outfeed(param.jaxpr):
+      return True
+  return False
+
+def primitive_uses_outfeed(prim: Primitive, params: Dict) -> bool:
+  if prim in outfeed_primitives:
+    return True
+  for param in params.values():
+    if isinstance(param, tuple):
+      if any(unsafe_map(_param_uses_outfeed, param)):
+        return True
+    elif _param_uses_outfeed(param):
+      return True
+  return False
 
 # ------------------- Map -------------------
 

@@ -631,6 +631,9 @@ class GDAPjitTest(jtu.JaxTestCase):
       for s in out.local_shards:
         self.assertArraysEqual(s.data, expected_matrix_mul[s.index])
 
+      out2 = f(out)
+      self.assertIsInstance(out2, global_device_array.GlobalDeviceArray)
+
       with self.assertRaisesRegex(
           ValueError, ('For a non-GDA input, the corresponding resource in '
                        'in_axis_resources cannot be `pjit.FROM_GDA`.')):
@@ -887,6 +890,29 @@ class GDAPjitTest(jtu.JaxTestCase):
     with mesh(global_mesh.devices, global_mesh.axis_names):
       pjit(lambda x: x, in_axis_resources=from_gda_dup, out_axis_resources=None)(
           input_gda)
+
+  def test_no_recompilation_due_to_in_axis_resources(self):
+    global_mesh = create_global_mesh((1, 2), ('x', 'y'))
+    global_input_shape = (8, 2)
+    mesh_axes = P(None,)
+    input_gda = create_gda(global_input_shape, global_mesh, mesh_axes)
+
+    with jax._src.config.parallel_functions_output_gda(True):
+      @partial(pjit, in_axis_resources=mesh_axes, out_axis_resources=mesh_axes)
+      def f(x):
+        return x
+
+      with mesh(global_mesh.devices, global_mesh.axis_names):
+        out_gda = f(input_gda)
+        self.assertEqual(out_gda._mesh_axes, ())
+
+        before_cache = pjit_lib._pjit_lower.cache_info()
+        f(out_gda)
+        after_cache = pjit_lib._pjit_lower.cache_info()
+
+        self.assertNotEqual(id(before_cache), id(after_cache))
+        self.assertEqual(before_cache.hits + 1, after_cache.hits)
+        self.assertEqual(before_cache.misses, after_cache.misses)
 
 
 def spec_regex(s):

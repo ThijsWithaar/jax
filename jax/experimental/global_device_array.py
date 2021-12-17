@@ -16,7 +16,7 @@
 from collections import defaultdict, Counter
 import dataclasses
 import numpy as np
-from typing import Callable, Sequence, Tuple, Union, Mapping, Optional, List, Dict
+from typing import Callable, Sequence, Tuple, Union, Mapping, Optional, List, Dict, NamedTuple
 
 from jax.experimental import maps
 from jax import core
@@ -40,14 +40,14 @@ class _HashableIndex:
   val: Index
 
   def __hash__(self):
-    return hash(tuple([(v.start, v.stop, v.step) for v in self.val]))
+    return hash(tuple((v.start, v.stop, v.step) for v in self.val))
 
   def __eq__(self, other):
     return self.val == other.val
 
 
-def get_shard_indices(global_shape: Shape, global_mesh: pxla.Mesh,
-                      mesh_axes: MeshAxes) -> Mapping[Device, Index]:
+def _get_indices(global_shape: Shape, global_mesh: pxla.Mesh,
+                 mesh_axes: MeshAxes) -> Tuple[pxla.Index, ...]:
   # Import here to avoid cyclic import error when importing gda in pjit.py.
   from jax.experimental.pjit import get_array_mapping, _prepare_axis_resources
 
@@ -66,10 +66,30 @@ def get_shard_indices(global_shape: Shape, global_mesh: pxla.Mesh,
     assert isinstance(index, tuple)
     for idx in index:
       assert isinstance(idx, slice)
+  return indices
+
+
+def get_shard_indices(global_shape: Shape, global_mesh: pxla.Mesh,
+                      mesh_axes: MeshAxes) -> Mapping[Device, Index]:
+  indices = _get_indices(global_shape, global_mesh, mesh_axes)
   # The type: ignore is to ignore the type returned by `spec_to_indices`.
   return dict(
       (d, i)
       for d, i in safe_zip(global_mesh.devices.flat, indices))  # type: ignore
+
+
+def get_shard_indices_replica_ids(
+    global_shape: Shape, global_mesh: pxla.Mesh,
+    mesh_axes: MeshAxes) -> Mapping[Device, Tuple[Index, int]]:
+  indices = _get_indices(global_shape, global_mesh, mesh_axes)
+  index_to_replica: Dict[_HashableIndex, int] = Counter()
+  out = {}
+  for device, index in safe_zip(global_mesh.devices.flat, indices):
+    h_index = _HashableIndex(index)
+    replica_id = index_to_replica[h_index]
+    index_to_replica[h_index] += 1
+    out[device] = (index, replica_id)
+  return out
 
 
 def get_shard_shape(global_shape, global_mesh, mesh_axes) -> Shape:
@@ -104,6 +124,11 @@ class Shard:
   replica_id: int
   # None if this `Shard` lives on a non-local device.
   data: Optional[DeviceArray] = None
+
+
+class _GdaFastPathArgs(NamedTuple):
+  local_indices_replica_ids: Mapping[Device, Tuple[Index, int]]
+  local_devices: Sequence[Device]
 
 
 class GlobalDeviceArray:
@@ -188,7 +213,8 @@ class GlobalDeviceArray:
   """
 
   def __init__(self, global_shape: Shape, global_mesh: pxla.Mesh,
-               mesh_axes: MeshAxes, device_buffers: Sequence[DeviceArray]):
+               mesh_axes: MeshAxes, device_buffers: Sequence[DeviceArray],
+               _gda_fast_path_args: Optional[_GdaFastPathArgs] = None):
     """Constructor of GlobalDeviceArray class.
 
     Args:
@@ -213,9 +239,17 @@ class GlobalDeviceArray:
     self._global_shape = global_shape
     self._global_mesh = global_mesh
     self._mesh_axes = mesh_axes
-    assert len(device_buffers) == len(self._global_mesh.local_devices)
-    self._global_shards, self._local_shards = self._create_shards(
-        device_buffers)
+    self._device_buffers = device_buffers
+    # Optionally precomputed for performance.
+    self._gda_fast_path_args = _gda_fast_path_args
+    self._current_process = xb.process_index()
+    self._local_shards = self._create_local_shards()
+
+    if self._gda_fast_path_args is None:
+      local_devices = self._global_mesh.local_devices
+    else:
+      local_devices = self._gda_fast_path_args.local_devices
+    assert len(device_buffers) == len(local_devices)
 
     ss = get_shard_shape(self._global_shape, self._global_mesh, self._mesh_axes)
     assert all(db.shape == ss for db in device_buffers), (
@@ -244,43 +278,57 @@ class GlobalDeviceArray:
   def is_fully_replicated(self) -> bool:
     return self.shape == self.local_data(0).shape
 
-  def _create_shards(
-      self, device_buffers: Sequence[DeviceArray]
-  ) -> Tuple[Sequence[Shard], Sequence[Shard]]:
-    indices = get_shard_indices(self._global_shape, self._global_mesh,
-                                self._mesh_axes)
-    device_to_buffer = dict((db.device(), db) for db in device_buffers)
-    gs, ls = [], []
-    index_to_replica: Dict[_HashableIndex, int] = Counter()
-    for device, index in indices.items():
-      h_index = _HashableIndex(index)
-      replica_id = index_to_replica[h_index]
-      index_to_replica[h_index] += 1
-      local_shard = device.process_index == xb.process_index()
-      buf = device_to_buffer[device] if local_shard else None
-      sh = Shard(device, index, replica_id, buf)
-      gs.append(sh)
-      if local_shard:
-        if sh.data is None:
-          raise ValueError("Local shard's data field should not be None.")
-        ls.append(sh)
-    return gs, ls
+  def _create_local_shards(self) -> Sequence[Shard]:
+    if self._gda_fast_path_args is not None:
+      local_idx_rid = self._gda_fast_path_args.local_indices_replica_ids
+    else:
+      global_indices_rid = get_shard_indices_replica_ids(
+        self._global_shape, self._global_mesh, self._mesh_axes)
+      local_idx_rid = dict((d, global_indices_rid[d])
+                           for d in self._global_mesh.local_devices)
+    device_to_buffer = dict((db.device(), db) for db in self._device_buffers)
+    return [
+        Shard(d, index, rid, device_to_buffer[d])
+        for d, (index, rid) in local_idx_rid.items()
+    ]
 
-  @property
+  @pxla.maybe_cached_property
   def local_shards(self) -> Sequence[Shard]:
+    """Returns local shards belonging to the current process.
+
+    The data will is always materialized for local shards.
+    """
     for s in self._local_shards:
       # Ignore the type because mypy thinks data is None but local_shards
-      # cannot have data=None which is checked in `_create_shards`.
+      # cannot have data=None which is checked in `_create_local_shards`.
       if s.data.aval is None:  # type: ignore
         s.data.aval = core.ShapedArray(s.data.shape, s.data.dtype)  # type: ignore
     return self._local_shards
 
-  @property
+  @pxla.maybe_cached_property
   def global_shards(self) -> Sequence[Shard]:
-    for g in self._global_shards:
-      if g.data is not None and g.data.aval is None:
-        g.data.aval = core.ShapedArray(g.data.shape, g.data.dtype)
-    return self._global_shards
+    """Returns global shards across all processes.
+
+    The data will be None for non-local devices with respect to the current
+    process.
+    """
+    # Populating global_shards lazily (i.e. when requested) because populating
+    # sthem eagerly leads to a performance regression when training on large
+    # models.
+    # Also as this a cached property, once calculated, it should be cached. So
+    # multiple accesses should be cheap.
+    global_indices_rid = get_shard_indices_replica_ids(
+        self._global_shape, self._global_mesh, self._mesh_axes)
+    device_to_buffer = dict((db.device(), db) for db in self._device_buffers)
+    global_shards = []
+    for device, (index, rid) in global_indices_rid.items():
+      local_shard = device.process_index == self._current_process
+      buf = device_to_buffer[device] if local_shard else None
+      if buf is not None and buf.aval is None:
+        buf.aval = core.ShapedArray(buf.shape, buf.dtype)
+      sh = Shard(device, index, rid, buf)
+      global_shards.append(sh)
+    return global_shards
 
   def local_data(self, index) -> DeviceArray:
     return self.local_shards[index].data
@@ -333,22 +381,22 @@ xla.pytype_aval_mappings[GlobalDeviceArray] = lambda x: core.ShapedArray(
     x.shape, x.dtype)
 xla.canonicalize_dtype_handlers[GlobalDeviceArray] = pxla.identity
 
-def _gsda_shard_arg(x, devices, indices):
+def _gda_shard_arg(x, devices, indices):
   pjit_mesh = maps.thread_resources.env.physical_mesh
   if x._global_mesh != pjit_mesh:
     raise ValueError("Pjit's mesh and GDA's mesh should be equal. Got Pjit "
                      f"mesh: {pjit_mesh},\n GDA mesh: {x._global_mesh}")
-  assert all(g.index == i for g, i in safe_zip(x.global_shards, indices)), (
-      "Indices calculated by GDA and pjit do not match. Please file a bug "
-      "on https://github.com/google/jax/issues. "
-      f"Got GDA indices: {[g.index for g in x.global_shards]},\n"
-      f"pjit indices: {indices}")
   return [s.data for s in x.local_shards]
-pxla.shard_arg_handlers[GlobalDeviceArray] = _gsda_shard_arg
+pxla.shard_arg_handlers[GlobalDeviceArray] = _gda_shard_arg
 
 
-def _gsda_array_result_handler(global_aval, out_axis_resources, global_mesh):
-  return lambda bufs: GlobalDeviceArray(global_aval.shape, global_mesh,
-                                        out_axis_resources, bufs)
-pxla.global_result_handlers[core.ShapedArray] = _gsda_array_result_handler
-pxla.global_result_handlers[core.ConcreteArray] = _gsda_array_result_handler
+def _gda_array_result_handler(global_aval, out_axis_resources, global_mesh):
+  global_idx_rid = get_shard_indices_replica_ids(global_aval.shape, global_mesh,
+                                                 out_axis_resources)
+  local_devices = global_mesh.local_devices
+  local_idx_rid = dict((d, global_idx_rid[d]) for d in local_devices)
+  fast_path_args = _GdaFastPathArgs(local_idx_rid, local_devices)
+  return lambda bufs: GlobalDeviceArray(
+      global_aval.shape, global_mesh, out_axis_resources, bufs, fast_path_args)
+pxla.global_result_handlers[core.ShapedArray] = _gda_array_result_handler
+pxla.global_result_handlers[core.ConcreteArray] = _gda_array_result_handler

@@ -83,8 +83,9 @@ def psum(x, axis_name, *, axis_index_groups=None):
   leaves, treedef = tree_util.tree_flatten(x)
   leaves = [lax.convert_element_type(l, np.int32)
             if dtypes.dtype(l) == np.bool_ else l for l in leaves]
-  out_flat = psum_p.bind(*leaves, axes=axis_name,
-                         axis_index_groups=axis_index_groups)
+  axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
+  out_flat = psum_p.bind(
+      *leaves, axes=tuple(axis_name), axis_index_groups=axis_index_groups)
   return tree_util.tree_unflatten(treedef, out_flat)
 
 def pmean(x, axis_name, *, axis_index_groups=None):
@@ -145,6 +146,7 @@ def pmax(x, axis_name, *, axis_index_groups=None):
     raise ValueError("axis_index_groups only supported for sums over just named axes")
   _validate_reduce_axis_index_groups(axis_index_groups)
   leaves, treedef = tree_util.tree_flatten(x)
+  axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
   out_flat = pmax_p.bind(*leaves, axes=axis_name,
                          axis_index_groups=axis_index_groups)
   return tree_util.tree_unflatten(treedef, out_flat)
@@ -174,6 +176,7 @@ def pmin(x, axis_name, *, axis_index_groups=None):
     raise ValueError("axis_index_groups only supported for sums over just named axes")
   _validate_reduce_axis_index_groups(axis_index_groups)
   leaves, treedef = tree_util.tree_flatten(x)
+  axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
   out_flat = pmin_p.bind(*leaves, axes=axis_name,
                          axis_index_groups=axis_index_groups)
   return tree_util.tree_unflatten(treedef, out_flat)
@@ -202,6 +205,11 @@ def _validate_reduce_axis_index_groups(axis_index_groups):
   if {i for g in axis_index_groups for i in g} != set(axis_space):
     raise ValueError("axis_index_groups must cover all indices exactly once")
 
+def _canonicalize_axis_index_groups(axis_index_groups):
+  if axis_index_groups is None:
+    return
+  return tuple(map(tuple, axis_index_groups))
+
 def ppermute(x, axis_name, perm):
   """Perform a collective permutation according to the permutation ``perm``.
 
@@ -228,7 +236,8 @@ def ppermute(x, axis_name, perm):
     ``axis_name`` gathered from ``x`` according to the permutation ``perm``.
   """
   return tree_util.tree_map(
-      partial(ppermute_p.bind, axis_name=axis_name, perm=tuple(perm)), x)
+      partial(ppermute_p.bind, axis_name=axis_name,
+              perm=tuple(map(tuple, perm))), x)
 
 def pshuffle(x, axis_name, perm):
   """Convenience wrapper of jax.lax.ppermute with alternate permutation encoding
@@ -327,6 +336,7 @@ def all_to_all(x, axis_name, split_axis, concat_axis, *, axis_index_groups=None,
     Otherwise array with shape similar to the input shape, except with split_axis
     divided by axis size and concat_axis multiplied by axis size.
   """
+  axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
   def bind(x, split_axis=split_axis, concat_axis=concat_axis):
     group_size = psum(1, axis_name, axis_index_groups=axis_index_groups)
     if tiled:
@@ -400,7 +410,9 @@ def pdot(x, y, axis_name, pos_contract=((), ()), pos_batch=((), ()),
          precision=None):
   if not isinstance(axis_name, (list, tuple)):
     axis_name = (axis_name,)
-  return pdot_p.bind(x, y, axis_name=axis_name,
+  pos_contract = tuple(map(tuple, pos_contract))
+  pos_batch = tuple(map(tuple, pos_batch))
+  return pdot_p.bind(x, y, axis_name=tuple(axis_name),
                      pos_contract=pos_contract, pos_batch=pos_batch,
                      precision=lax.canonicalize_precision(precision))
 
@@ -694,7 +706,7 @@ def _psum_transpose_rule(cts, *args, axes, axis_index_groups):
   # We treat psum as psum + pbroadcast, which is why the transpose reduces
   # over the named axes again (unlike for positional axes).
   nonzero_out_cts, treedef = tree_util.tree_flatten(cts)
-  nonzero_in_cts = psum_p.bind(*nonzero_out_cts, axes=named_axes,
+  nonzero_in_cts = psum_p.bind(*nonzero_out_cts, axes=tuple(named_axes),
                                axis_index_groups=axis_index_groups)
   return tree_util.tree_unflatten(treedef, nonzero_in_cts)
 
@@ -793,7 +805,8 @@ def _ppermute_batcher(axis_size, frame_name, _, vals_in, dims_in, axis_name, per
     raise NotImplementedError("ppermute batcher only supports a single axis")
   assert axis_name[0] == frame_name, "ppermute batcher called with a wrong axis!"
   assert len(perm) == axis_size, "Permutation doesn't match the axis size!"
-  assert d is not batching.not_mapped
+  if d is batching.not_mapped:
+    return v, d
   perm_indices = np.zeros(axis_size, dtype=int)
   for src, dst in perm:
     perm_indices[dst] = src
@@ -1037,6 +1050,7 @@ def all_gather(x, axis_name, *, axis_index_groups=None, axis=0, tiled=False):
    [[12 13 14 15]
     [ 4  5  6  7]]]
   """
+  axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
   axis_size = psum(1, axis_name, axis_index_groups=axis_index_groups)
   bind = partial(all_gather_p.bind, all_gather_dimension=axis,
                  axis_name=axis_name, axis_index_groups=axis_index_groups,
@@ -1318,6 +1332,7 @@ def psum_scatter(x, axis_name, *, scatter_dimension=0, axis_index_groups=None, t
    [16 18]]
   """
   axis_size = psum(1, axis_name, axis_index_groups=axis_index_groups)
+  axis_index_groups = _canonicalize_axis_index_groups(axis_index_groups)
   bind = partial(
       reduce_scatter_p.bind,
       axis_name=axis_name,
@@ -1424,8 +1439,8 @@ def _pdot_vmap_collective_rule(axis_size, frame_name, _, vals_in, dims_in, *, ax
   y_pos_batch = [d + (d >= y_dim) for d in y_pos_batch]
   remaining_axis_names = tuple(n for n in axis_name if n != frame_name)
   out = pdot_p.bind(x, y, axis_name=remaining_axis_names,
-                    pos_contract=[x_pos_contract, y_pos_contract],
-                    pos_batch=[x_pos_batch, y_pos_batch],
+                    pos_contract=(tuple(x_pos_contract), tuple(y_pos_contract)),
+                    pos_batch=(tuple(x_pos_batch), tuple(y_pos_batch)),
                     precision=precision)
   return out, None
 batching.axis_primitive_batchers[pdot_p] = _pdot_vmap_collective_rule

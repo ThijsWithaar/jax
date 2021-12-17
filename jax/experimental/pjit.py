@@ -232,7 +232,7 @@ def pjit(fun: Callable,
     # TODO(yashkatariya): This is a hack. This should go away when avals have
     # is_global attribute.
     in_positional_semantics = tuple(
-        maps._PositionalSemantics.GLOBAL if type(a) is GDA else maps
+        maps._PositionalSemantics.GLOBAL if isinstance(a, GDA) else maps
         ._positional_semantics for a in args_flat)
     out_positional_semantics = maps._positional_semantics
     jaxpr, in_axis_resources_flat, out_axis_resources_flat = _pjit_jaxpr(
@@ -866,9 +866,9 @@ def _sharding_constraint_translation_rule(ctx, avals_in, avals_out, x_node, *,
       ctx.builder, x_node, get_aval_sharding_proto(aval, axis_resources, mesh))]
 xla.register_translation(sharding_constraint_p, _sharding_constraint_translation_rule)
 
-def _sharding_constraint_mhlo_lowering(ctx, avals_in, avals_out, x_node, *,
-                                       axis_resources, resource_env):
-  aval, = avals_in
+def _sharding_constraint_mhlo_lowering(ctx, x_node, *, axis_resources,
+                                       resource_env):
+  aval, = ctx.avals_in
   mesh = resource_env.physical_mesh
   return [mlir.wrap_with_sharding_op(
       x_node, get_aval_sharding_proto(aval, axis_resources, mesh))]
@@ -931,19 +931,26 @@ def local_to_global(positional_semantics, mesh, avals, axes):
 
 def _canonicalize_spec(in_axis_resources_flat: ParsedPartitionSpec, arg):
   if isinstance(arg, GDA):
-    gsda_ppspec = gsda_mesh_axes_to_parsed_pspec(arg._mesh_axes)
+    gda_ppspec = gda_mesh_axes_to_parsed_pspec(arg._mesh_axes)
     if (not _is_from_gda(in_axis_resources_flat) and
-        not in_axis_resources_flat.eq_given_rank(gsda_ppspec, len(arg.shape))):
+        not in_axis_resources_flat.eq_given_rank(gda_ppspec, len(arg.shape))):
       raise ValueError(
           'Got an input GDA to pjit with different partitioning than specified in '
           "the in_axis_resources argument to pjit. The partitioning must match, or "
           "use `jax.experimental.pjit.FROM_GDA` in `in_axis_resources`. "
-          f"Got GDA spec: {gsda_ppspec.user_spec} and "
+          f"Got GDA spec: {gda_ppspec.user_spec} and "
           f"pjit spec: {in_axis_resources_flat.user_spec} for GDA: {arg}")
-    return gsda_ppspec
+    # Return `gda_ppspec` only if `FROM_GDA` exists in in_axis_resources.
+    # This is because `gda_ppspec` and `in_axis_resources_flat` may not be
+    # equal at this stage. The above check canonicalizes the specs and then
+    # checks for equality (i.e. checks for equality given the rank of the input).
+    if _is_from_gda(in_axis_resources_flat):
+      return gda_ppspec
+    else:
+      return in_axis_resources_flat
   return in_axis_resources_flat
 
-def gsda_mesh_axes_to_parsed_pspec(mesh_axes) -> ParsedPartitionSpec:
+def gda_mesh_axes_to_parsed_pspec(mesh_axes) -> ParsedPartitionSpec:
   if not isinstance(mesh_axes, PartitionSpec):
     pspec = PartitionSpec(*mesh_axes)
   else:
